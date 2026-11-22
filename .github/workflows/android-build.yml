@@ -11,6 +11,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_HOME: /usr/local/lib/android/sdk
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,18 +25,13 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Prepare Android SDK & Accept All Licenses
+      - name: Accept Android SDK Licenses
         run: |
-          export ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
-          export ANDROID_HOME=/usr/local/lib/android/sdk
-          mkdir -p "$ANDROID_SDK_ROOT/licenses"
-          SDKMANAGER=$(find "$ANDROID_SDK_ROOT/cmdline-tools" -name "sdkmanager" 2>/dev/null | head -n 1)
+          mkdir -p "$ANDROID_HOME/licenses"
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name "sdkmanager" 2>/dev/null | head -n 1)
           if [ -n "$SDKMANAGER" ]; then
-            yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" --licenses > /dev/null 2>&1 || true
+            yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses > /dev/null 2>&1 || true
           fi
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
