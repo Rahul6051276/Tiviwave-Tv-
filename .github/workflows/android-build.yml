@@ -3,9 +3,10 @@ name: Build Android TV APK
 on:
   push:
     branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -55,8 +56,16 @@ jobs:
       - name: Build Debug APK
         run: gradle :app:assembleDebug --no-daemon
 
-      - name: Upload Android TV Debug APK
+      - name: Upload Android TV Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: TiviWave-TV-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: TiviWave TV v1.0.${{ github.run_number }}
+          body: Automated Android TV APK build #${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
