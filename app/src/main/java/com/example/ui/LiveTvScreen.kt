@@ -1,6 +1,13 @@
 package com.example.ui
 
+import android.view.KeyEvent as AndroidKeyEvent
+import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -19,11 +26,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.AddCircle
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.LiveTv
 import androidx.compose.material.icons.filled.PlayArrow
@@ -32,6 +42,7 @@ import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -42,12 +53,18 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -86,16 +103,28 @@ import com.example.ui.theme.SignalAmber
 import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+private data class GroupDrawerEntry(
+    val id: String,
+    val name: String,
+    val subtitle: String,
+    val count: Int
+)
+
 /**
- * 3-Pane TiviMate-Inspired Android TV Live TV Guide:
- * - Left Pane: Selected Live TV Categories (+ All Channels & Favorites)
- * - Middle Pane: Channels list with channel number, logo, title, and live EPG bar
- * - Right Pane: Live Hardware-Accelerated Media3 Preview + Full EPG Timeline
- * Pressing OK on a channel immediately launches Full-Screen Playback.
+ * TiviMate-Style Selected Group Live TV Screen:
+ * - Clean #0D1117 / #141A24 broadcast layout without boxy neon borders or cluttered banners.
+ * - Top section: Large live video preview window (~40% width) + active channel/program details
+ *   (current program title, time range + progress bar, favorite toggle, group switcher).
+ * - Bottom section: Full-width Channel + EPG Timeline guide (+30m, +1h, +1.5h, +2h time slots)
+ *   showing channel number, logo, channel name, and proportional program blocks.
+ * - Group Switcher Drawer opens cleanly on demand (via Group pill or Back/Left) and stays out
+ *   of the way while browsing channels.
  */
 @Composable
 fun LiveTvScreen(
@@ -117,6 +146,37 @@ fun LiveTvScreen(
         selectedCategories.filter { it.type == ContentType.LIVE }
     }
 
+    val groupEntries = remember(liveCategories, allLiveChannels) {
+        buildList {
+            add(
+                GroupDrawerEntry(
+                    id = "ALL",
+                    name = "All Channels",
+                    subtitle = "All Selected Groups",
+                    count = allLiveChannels.size
+                )
+            )
+            add(
+                GroupDrawerEntry(
+                    id = "FAVORITES",
+                    name = "Favorites",
+                    subtitle = "Saved Channels",
+                    count = allLiveChannels.count { it.isFavorite }
+                )
+            )
+            liveCategories.forEach { cat ->
+                add(
+                    GroupDrawerEntry(
+                        id = cat.id,
+                        name = cat.name,
+                        subtitle = cat.countryGroup,
+                        count = allLiveChannels.count { it.categoryId == cat.id }
+                    )
+                )
+            }
+        }
+    }
+
     val filteredChannels = remember(allLiveChannels, selectedCategoryId) {
         when (selectedCategoryId) {
             "ALL" -> allLiveChannels
@@ -125,10 +185,8 @@ fun LiveTvScreen(
         }
     }
 
-    LaunchedEffect(filteredChannels) {
-        if (previewChannel == null && filteredChannels.isNotEmpty()) {
-            onFocusChannel(filteredChannels.first())
-        }
+    val activeGroupName = remember(groupEntries, selectedCategoryId) {
+        groupEntries.firstOrNull { it.id == selectedCategoryId }?.name ?: "All Channels"
     }
 
     if (allLiveChannels.isEmpty()) {
@@ -140,473 +198,554 @@ fun LiveTvScreen(
         return
     }
 
+    var isGroupDrawerOpen by remember { mutableStateOf(false) }
+    val channelListState = rememberLazyListState()
+    val groupListState = rememberLazyListState()
+    val firstChannelFocusRequester = remember { FocusRequester() }
+    val activeGroupFocusRequester = remember { FocusRequester() }
+    val scope = rememberCoroutineScope()
+
+    // Ensure a channel is selected for preview when entering or changing groups
+    LaunchedEffect(selectedCategoryId, filteredChannels) {
+        if (filteredChannels.isNotEmpty() &&
+            (previewChannel == null || filteredChannels.none { it.id == previewChannel.id })
+        ) {
+            onFocusChannel(filteredChannels.first())
+        }
+    }
+
+    // Predictable D-Pad entry point: focus active/first channel row when entering or after closing group drawer
+    LaunchedEffect(selectedCategoryId, isGroupDrawerOpen, filteredChannels.size) {
+        if (!isGroupDrawerOpen && filteredChannels.isNotEmpty()) {
+            val activeIdx = filteredChannels.indexOfFirst { it.id == previewChannel?.id }.coerceAtLeast(0)
+            channelListState.scrollToItem(activeIdx)
+            delay(60L)
+            runCatching { firstChannelFocusRequester.requestFocus() }
+        }
+    }
+
+    // Move focus straight to the active group when opening the collapsible Group Switcher Drawer
+    LaunchedEffect(isGroupDrawerOpen) {
+        if (isGroupDrawerOpen) {
+            val idx = groupEntries.indexOfFirst { it.id == selectedCategoryId }.coerceAtLeast(0)
+            groupListState.scrollToItem(idx)
+            delay(60L)
+            runCatching { activeGroupFocusRequester.requestFocus() }
+        }
+    }
+
+    BackHandler(enabled = isGroupDrawerOpen) {
+        isGroupDrawerOpen = false
+    }
+
     val nowMs = System.currentTimeMillis()
+    val slotDurationMs = 30 * 60_000L // 30-minute timeline columns
+    // Align timeline anchor to current half-hour boundary
+    val timelineAnchorMs = remember(nowMs / 60_000L) {
+        (nowMs / slotDurationMs) * slotDurationMs
+    }
+    val timeSlots = remember(timelineAnchorMs) {
+        listOf(
+            timelineAnchorMs,
+            timelineAnchorMs + slotDurationMs,
+            timelineAnchorMs + slotDurationMs * 2,
+            timelineAnchorMs + slotDurationMs * 3
+        )
+    }
+    val timeFmt = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
+
     val activePreview = previewChannel ?: filteredChannels.firstOrNull()
     val activeEpgKey = activePreview?.let { it.epgChannelId.ifBlank { it.id } }.orEmpty()
     val activePrograms = epgByChannelId[activeEpgKey].orEmpty()
+    val activeNowProgram = activePrograms.firstOrNull { it.isCurrentAt(nowMs) } ?: activePrograms.firstOrNull()
+    val activeNextProgram = activePrograms.firstOrNull {
+        it.startTimeMs > (activeNowProgram?.startTimeMs ?: nowMs)
+    }
 
-    Row(
+    Box(
         modifier = Modifier
             .fillMaxSize()
             .background(ObsidianVoid)
-            .padding(horizontal = 16.dp, vertical = 14.dp),
-        horizontalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // -----------------------------------------------------------------
-        // PANE 1 (LEFT ~22%): SELECTED CATEGORIES
-        // -----------------------------------------------------------------
         Column(
             modifier = Modifier
-                .weight(0.22f)
-                .fillMaxHeight()
-                .clip(RoundedCornerShape(14.dp))
-                .background(ObsidianBase)
-                .border(1.dp, DividerSlate.copy(alpha = 0.65f), RoundedCornerShape(14.dp))
-                .padding(10.dp)
+                .fillMaxSize()
+                .padding(horizontal = 20.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            // -----------------------------------------------------------------
+            // TOP SECTION (~39% HEIGHT): BIG PREVIEW LEFT + PROGRAM DETAILS RIGHT
+            // -----------------------------------------------------------------
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 6.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+                    .weight(0.40f),
+                horizontalArrangement = Arrangement.spacedBy(18.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = "Groups",
-                    style = MaterialTheme.typography.titleLarge,
-                    color = TextPrimary
-                )
-                TvBadge(text = "${liveCategories.size}")
-            }
-            Spacer(Modifier.height(6.dp))
-
-            LazyColumn(
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-                contentPadding = PaddingValues(3.dp),
-                modifier = Modifier.weight(1f)
-            ) {
-                item(key = "cat_all") {
-                    CategoryPaneRow(
-                        name = "All Channels",
-                        count = allLiveChannels.size,
-                        selected = selectedCategoryId == "ALL",
-                        onClick = { onSelectCategory("ALL") },
-                        testTag = "live_cat_all"
-                    )
-                }
-                item(key = "cat_fav") {
-                    CategoryPaneRow(
-                        name = "Favorites",
-                        count = allLiveChannels.count { it.isFavorite },
-                        selected = selectedCategoryId == "FAVORITES",
-                        onClick = { onSelectCategory("FAVORITES") },
-                        testTag = "live_cat_favorites"
-                    )
-                }
-                items(liveCategories, key = { it.id }) { cat ->
-                    val count = allLiveChannels.count { it.categoryId == cat.id }
-                    CategoryPaneRow(
-                        name = cat.name,
-                        subtitle = cat.countryGroup,
-                        count = count,
-                        selected = selectedCategoryId == cat.id,
-                        onClick = { onSelectCategory(cat.id) },
-                        testTag = "live_cat_${cat.id}"
-                    )
-                }
-            }
-
-            Spacer(Modifier.height(8.dp))
-            TvActionButton(
-                text = "Edit Filter",
-                icon = Icons.Default.FilterList,
-                onClick = onReopenFilter,
-                modifier = Modifier.fillMaxWidth(),
-                testTag = "live_edit_filter_button"
-            )
-        }
-
-        // -----------------------------------------------------------------
-        // PANE 2 (MIDDLE ~38%): CHANNELS WITH LOGOS & CURRENT EPG
-        // -----------------------------------------------------------------
-        Column(
-            modifier = Modifier
-                .weight(0.38f)
-                .fillMaxHeight()
-                .clip(RoundedCornerShape(14.dp))
-                .background(ObsidianBase)
-                .border(1.dp, DividerSlate.copy(alpha = 0.65f), RoundedCornerShape(14.dp))
-                .padding(10.dp)
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 6.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                val heading = when (selectedCategoryId) {
-                    "ALL" -> "All Live Channels"
-                    "FAVORITES" -> "Favorite Channels"
-                    else -> liveCategories.firstOrNull { it.id == selectedCategoryId }?.name ?: "Channels"
-                }
-                Text(
-                    text = heading,
-                    style = MaterialTheme.typography.titleLarge,
-                    color = TextPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-                TvBadge(text = "${filteredChannels.size} CH")
-            }
-            Spacer(Modifier.height(6.dp))
-
-            if (filteredChannels.isEmpty()) {
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text(
-                        text = "No channels in this group.",
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = TextMuted
-                    )
-                }
-            } else {
-                LazyColumn(
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    contentPadding = PaddingValues(4.dp)
+                // Large Live Video Preview (~40% width)
+                Box(
+                    modifier = Modifier
+                        .weight(0.40f)
+                        .fillMaxHeight()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color.Black)
+                        .border(1.dp, DividerSlate.copy(alpha = 0.55f), RoundedCornerShape(12.dp))
                 ) {
-                    items(filteredChannels, key = { it.id }) { channel ->
-                        val epgKey = channel.epgChannelId.ifBlank { channel.id }
-                        val programs = epgByChannelId[epgKey].orEmpty()
-                        val currentProgram = programs.firstOrNull { it.isCurrentAt(nowMs) } ?: programs.firstOrNull()
-                        val isPreviewing = activePreview?.id == channel.id
+                    if (previewStream != null && previewStream.url.isNotBlank()) {
+                        LivePreviewVideoPlayer(
+                            resolvedStream = previewStream,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Image(
+                            painter = painterResource(id = R.drawable.img_cinema_backdrop_1795334414361),
+                            contentDescription = "Live preview backdrop",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
 
-                        TvFocusableSurface(
-                            onClick = { onOpenFullScreen(channel, filteredChannels) },
-                            onFocused = { onFocusChannel(channel) },
-                            selected = isPreviewing,
-                            focusScale = 1.025f,
-                            containerColor = MidnightPanel,
-                            selectedContainerColor = HighlightSlate,
-                            focusedContainerColor = BroadcastCyanDeep.copy(alpha = 0.72f),
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                    // Minimal Top-Left LIVE badge & resolving spinner
+                    Row(
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .testTag("live_channel_${channel.id}")
-                        ) { isFocused ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                // Channel Number
-                                Text(
-                                    text = if (channel.channelNumber > 0) channel.channelNumber.toString().padStart(3, '0') else "---",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = if (isFocused) Color.White else BroadcastCyan,
-                                    modifier = Modifier.width(34.dp)
-                                )
-
-                                // Channel Logo
-                                ChannelLogoThumbnail(
-                                    title = channel.title,
-                                    logoUrl = channel.posterUrl,
-                                    modifier = Modifier.size(44.dp)
-                                )
-                                Spacer(Modifier.width(12.dp))
-
-                                // Channel Name + Current EPG Program
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(
-                                            text = channel.title,
-                                            style = MaterialTheme.typography.titleMedium,
-                                            color = TextPrimary,
-                                            fontWeight = FontWeight.SemiBold,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                            modifier = Modifier.weight(1f)
-                                        )
-                                        if (channel.isFavorite) {
-                                            Spacer(Modifier.width(6.dp))
-                                            Icon(
-                                                imageVector = Icons.Default.Star,
-                                                contentDescription = "Favorite",
-                                                tint = SignalAmber,
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                        }
-                                    }
-                                    Spacer(Modifier.height(2.dp))
-                                    Text(
-                                        text = currentProgram?.title ?: "Live Broadcast • Press OK to watch full screen",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = if (isFocused) TextPrimary.copy(alpha = 0.9f) else TextMuted,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    if (currentProgram != null) {
-                                        Spacer(Modifier.height(4.dp))
-                                        LinearProgressIndicator(
-                                            progress = { currentProgram.progressAt(nowMs) },
-                                            color = BroadcastCyan,
-                                            trackColor = ObsidianVoid.copy(alpha = 0.6f),
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .height(3.dp)
-                                                .clip(RoundedCornerShape(2.dp))
-                                        )
-                                    }
-                                }
-                            }
+                                .clip(RoundedCornerShape(5.dp))
+                                .background(LiveCrimson.copy(alpha = 0.9f))
+                                .padding(horizontal = 7.dp, vertical = 3.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(6.dp)
+                                    .clip(CircleShape)
+                                    .background(Color.White)
+                            )
+                            Spacer(Modifier.width(5.dp))
+                            Text("LIVE", style = MaterialTheme.typography.labelSmall, color = Color.White)
+                        }
+                        if (isPreviewResolving) {
+                            CircularProgressIndicator(
+                                color = BroadcastCyan,
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(16.dp)
+                            )
                         }
                     }
                 }
-            }
-        }
 
-        // -----------------------------------------------------------------
-        // PANE 3 (RIGHT ~40%): LIVE PREVIEW PLAYER + EPG TIMELINE
-        // -----------------------------------------------------------------
-        Column(
-            modifier = Modifier
-                .weight(0.40f)
-                .fillMaxHeight(),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            // Top: 16:9 Live Preview Window
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(16f / 9f)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(ObsidianBase)
-                    .border(1.5.dp, DividerSlate, RoundedCornerShape(14.dp))
-            ) {
-                if (previewStream != null && previewStream.url.isNotBlank()) {
-                    LivePreviewVideoPlayer(
-                        resolvedStream = previewStream,
-                        modifier = Modifier.fillMaxSize()
-                    )
-                } else {
-                    Image(
-                        painter = painterResource(id = R.drawable.img_cinema_backdrop_1795334414361),
-                        contentDescription = "Live preview backdrop",
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize()
-                    )
-                }
-
-                // Subtle Top & Bottom Gradient Scrim
-                Box(
+                // Right Panel (~60% width): Active Channel & Program Details
+                Column(
                     modifier = Modifier
-                        .fillMaxSize()
-                        .background(
-                            Brush.verticalGradient(
-                                listOf(
-                                    ObsidianVoid.copy(alpha = 0.55f),
-                                    Color.Transparent,
-                                    ObsidianVoid.copy(alpha = 0.88f)
-                                )
-                            )
-                        )
-                )
-
-                // Top LIVE status badge
-                Row(
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        .weight(0.60f)
+                        .fillMaxHeight()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(ObsidianBase)
+                        .padding(horizontal = 18.dp, vertical = 14.dp),
+                    verticalArrangement = Arrangement.SpaceBetween
                 ) {
+                    // Header bar: Group Switcher pill + Favorite & Filter controls
                     Row(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(LiveCrimson)
-                            .padding(horizontal = 8.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(7.dp)
-                                .clip(CircleShape)
-                                .background(Color.White)
-                        )
-                        Spacer(Modifier.width(5.dp))
-                        Text("LIVE PREVIEW", style = MaterialTheme.typography.labelSmall, color = Color.White)
-                    }
-                    if (isPreviewResolving) {
-                        CircularProgressIndicator(
-                            color = BroadcastCyan,
-                            strokeWidth = 2.dp,
-                            modifier = Modifier.size(18.dp)
-                        )
-                    }
-                }
-
-                // Bottom channel info + action buttons
-                if (activePreview != null) {
-                    Row(
-                        modifier = Modifier
-                            .align(Alignment.BottomStart)
-                            .fillMaxWidth()
-                            .padding(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
+                        TvFocusableSurface(
+                            onClick = { isGroupDrawerOpen = true },
+                            focusScale = 1.03f,
+                            shape = RoundedCornerShape(8.dp),
+                            containerColor = MidnightPanel,
+                            focusedContainerColor = HighlightSlate,
+                            borderColor = DividerSlate.copy(alpha = 0.5f),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
+                            modifier = Modifier.testTag("live_group_switcher_button")
+                        ) { isFocused ->
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.List,
+                                    contentDescription = "Switch group",
+                                    tint = if (isFocused) TextPrimary else BroadcastCyan,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    text = "$activeGroupName (${filteredChannels.size})",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = TextPrimary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Icon(
+                                    imageVector = Icons.Default.ChevronRight,
+                                    contentDescription = null,
+                                    tint = TextMuted,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (activePreview != null) {
+                                TvActionButton(
+                                    text = if (activePreview.isFavorite) "Favorite" else "Save",
+                                    icon = if (activePreview.isFavorite) Icons.Default.Star else Icons.Default.StarBorder,
+                                    onClick = { onToggleFavorite(activePreview) },
+                                    testTag = "live_preview_favorite_button"
+                                )
+                                TvActionButton(
+                                    text = "Full Screen",
+                                    icon = Icons.Default.PlayArrow,
+                                    isPrimary = true,
+                                    onClick = { onOpenFullScreen(activePreview, filteredChannels) },
+                                    testTag = "live_preview_watch_button"
+                                )
+                            }
+                            TvActionButton(
+                                text = "",
+                                icon = Icons.Default.FilterList,
+                                onClick = onReopenFilter,
+                                testTag = "live_edit_filter_button"
+                            )
+                        }
+                    }
+
+                    // Active Channel & Current Program Info
+                    if (activePreview != null) {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                if (activePreview.channelNumber > 0) {
+                                    Text(
+                                        text = activePreview.channelNumber.toString().padStart(3, '0'),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = BroadcastCyan,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                                Text(
+                                    text = activePreview.title,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = TextSecondary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+
                             Text(
-                                text = activePreview.title,
-                                style = MaterialTheme.typography.titleLarge,
+                                text = activeNowProgram?.title ?: activePreview.title,
+                                style = MaterialTheme.typography.headlineMedium,
                                 color = TextPrimary,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
-                            Text(
-                                text = "Press OK on channel for Full Screen",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = BroadcastCyan
-                            )
-                        }
-                        Spacer(Modifier.width(8.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            TvActionButton(
-                                text = if (activePreview.isFavorite) "Saved" else "Fav",
-                                icon = if (activePreview.isFavorite) Icons.Default.Star else Icons.Default.StarBorder,
-                                onClick = { onToggleFavorite(activePreview) },
-                                testTag = "live_preview_favorite_button"
-                            )
-                            TvActionButton(
-                                text = "Watch",
-                                icon = Icons.Default.PlayArrow,
-                                isPrimary = true,
-                                onClick = { onOpenFullScreen(activePreview, filteredChannels) },
-                                testTag = "live_preview_watch_button"
-                            )
-                        }
-                    }
-                }
-            }
 
-            // Bottom: EPG Program Timeline
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(ObsidianBase)
-                    .border(1.dp, DividerSlate.copy(alpha = 0.65f), RoundedCornerShape(14.dp))
-                    .padding(14.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Default.Schedule,
-                            contentDescription = "EPG Schedule",
-                            tint = BroadcastCyan,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            text = "EPG Program Timeline",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = TextPrimary
-                        )
-                    }
-                    if (activePreview != null && activePreview.epgChannelId.isNotBlank()) {
-                        TvBadge(text = "EPG: ${activePreview.epgChannelId}")
-                    }
-                }
-
-                Spacer(Modifier.height(10.dp))
-
-                if (activePrograms.isEmpty()) {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text(
-                                text = "No EPG schedule available for this channel",
-                                style = MaterialTheme.typography.titleSmall,
-                                color = TextSecondary
-                            )
-                            Spacer(Modifier.height(4.dp))
-                            Text(
-                                text = "Attach an XMLTV EPG URL in Playlists & Filter or connect a Stalker Portal with EPG.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = TextMuted
-                            )
-                        }
-                    }
-                } else {
-                    val timeFormat = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
-                    LazyColumn(
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        items(activePrograms.take(12), key = { "${it.channelId}_${it.startTimeMs}" }) { prog ->
-                            val isNow = prog.isCurrentAt(nowMs)
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(if (isNow) HighlightSlate else MidnightPanel)
-                                    .border(
-                                        1.dp,
-                                        if (isNow) BroadcastCyan.copy(alpha = 0.6f) else DividerSlate.copy(alpha = 0.4f),
-                                        RoundedCornerShape(10.dp)
-                                    )
-                                    .padding(10.dp)
-                            ) {
+                            if (activeNowProgram != null) {
+                                val remainingMin = ((activeNowProgram.endTimeMs - nowMs) / 60_000L).coerceAtLeast(0L)
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
-                                    Text(
-                                        text = "${timeFormat.format(Date(prog.startTimeMs))} - ${timeFormat.format(Date(prog.endTimeMs))}",
-                                        style = MaterialTheme.typography.labelMedium,
-                                        color = if (isNow) BroadcastCyan else TextMuted
-                                    )
-                                    if (isNow) {
-                                        TvBadge(
-                                            text = "ON AIR",
-                                            containerColor = LiveCrimson.copy(alpha = 0.2f),
-                                            contentColor = LiveCrimson
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(
+                                            imageVector = Icons.Default.Schedule,
+                                            contentDescription = null,
+                                            tint = BroadcastCyan,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(
+                                            text = "${timeFmt.format(Date(activeNowProgram.startTimeMs))} – ${timeFmt.format(Date(activeNowProgram.endTimeMs))}  •  ${remainingMin}m left",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = BroadcastCyan
+                                        )
+                                    }
+                                    if (activeNextProgram != null) {
+                                        Text(
+                                            text = "Next: ${activeNextProgram.title}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = TextMuted,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
                                         )
                                     }
                                 }
-                                Spacer(Modifier.height(4.dp))
-                                Text(
-                                    text = prog.title,
-                                    style = MaterialTheme.typography.titleSmall,
-                                    color = TextPrimary,
-                                    fontWeight = FontWeight.SemiBold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
+                                LinearProgressIndicator(
+                                    progress = { activeNowProgram.progressAt(nowMs) },
+                                    color = BroadcastCyan,
+                                    trackColor = ElevatedSlate,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(4.dp)
+                                        .clip(RoundedCornerShape(2.dp))
                                 )
-                                if (prog.description.isNotBlank()) {
-                                    Spacer(Modifier.height(2.dp))
+                                if (activeNowProgram.description.isNotBlank()) {
                                     Text(
-                                        text = prog.description,
+                                        text = activeNowProgram.description,
                                         style = MaterialTheme.typography.bodySmall,
                                         color = TextSecondary,
                                         maxLines = 2,
                                         overflow = TextOverflow.Ellipsis
                                     )
                                 }
-                                if (isNow) {
-                                    Spacer(Modifier.height(6.dp))
-                                    LinearProgressIndicator(
-                                        progress = { prog.progressAt(nowMs) },
-                                        color = BroadcastCyan,
-                                        trackColor = ObsidianVoid,
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .height(3.dp)
-                                            .clip(RoundedCornerShape(2.dp))
+                            } else {
+                                Text(
+                                    text = "$activeGroupName • Live Broadcast Stream",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = TextMuted,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // -----------------------------------------------------------------
+            // BOTTOM SECTION (~60% HEIGHT): WIDE CHANNEL + EPG TIMELINE GUIDE
+            // -----------------------------------------------------------------
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(0.60f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(ObsidianBase)
+            ) {
+                // Timeline Header Row: Channel Column + 4 EPG Time Slots (+30m, +1h, +1.5h, +2h)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(MidnightPanel)
+                        .padding(horizontal = 14.dp, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        modifier = Modifier.weight(0.30f),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = activeGroupName.uppercase(),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = BroadcastCyan,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = "◀ Groups",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextMuted,
+                            modifier = Modifier.padding(end = 10.dp)
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.weight(0.70f),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        val slotOffsetLabels = listOf("Now", "+30m", "+1h", "+1.5h")
+                        val slotEndLabels = listOf("+30m", "+1h", "+1.5h", "+2h")
+                        timeSlots.forEachIndexed { idx, slotStart ->
+                            Row(
+                                modifier = Modifier.weight(1f),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = timeFmt.format(Date(slotStart)),
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (idx == 0) BroadcastCyan else TextSecondary,
+                                    fontWeight = if (idx == 0) FontWeight.Bold else FontWeight.Medium
+                                )
+                                Text(
+                                    text = if (idx == 0) slotOffsetLabels[0] else slotEndLabels[idx - 1],
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextMuted,
+                                    modifier = Modifier.padding(end = 6.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = DividerSlate.copy(alpha = 0.6f), thickness = 1.dp)
+
+                if (filteredChannels.isEmpty()) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text(
+                            text = "No channels in $activeGroupName",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = TextMuted
+                        )
+                    }
+                } else {
+                    val activeFocusIndex = remember(filteredChannels, activePreview?.id) {
+                        filteredChannels.indexOfFirst { it.id == activePreview?.id }.coerceAtLeast(0)
+                    }
+
+                    LazyColumn(
+                        state = channelListState,
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        itemsIndexed(filteredChannels, key = { _, ch -> ch.id }) { index, channel ->
+                            val epgKey = channel.epgChannelId.ifBlank { channel.id }
+                            val programs = epgByChannelId[epgKey].orEmpty()
+                            val isSelectedChannel = activePreview?.id == channel.id
+
+                            TvFocusableSurface(
+                                onClick = { onOpenFullScreen(channel, filteredChannels) },
+                                onFocused = {
+                                    onFocusChannel(channel)
+                                    scope.launch {
+                                        channelListState.animateScrollToItem(index)
+                                    }
+                                },
+                                selected = isSelectedChannel,
+                                focusScale = 1.015f,
+                                shape = RoundedCornerShape(8.dp),
+                                containerColor = ObsidianBase,
+                                selectedContainerColor = MidnightPanel,
+                                focusedContainerColor = HighlightSlate,
+                                borderColor = Color.Transparent,
+                                focusedBorderColor = BroadcastCyan,
+                                focusedBorderWidth = 2.dp,
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .then(
+                                        if (index == activeFocusIndex) {
+                                            Modifier.focusRequester(firstChannelFocusRequester)
+                                        } else {
+                                            Modifier
+                                        }
                                     )
+                                    .onPreviewKeyEvent { keyEvent ->
+                                        if (keyEvent.type == KeyEventType.KeyDown &&
+                                            keyEvent.nativeKeyEvent.keyCode == AndroidKeyEvent.KEYCODE_DPAD_LEFT
+                                        ) {
+                                            isGroupDrawerOpen = true
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    .testTag("live_channel_${channel.id}")
+                            ) { isFocused ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    // Left Channel Info Strip (~30% width)
+                                    Row(
+                                        modifier = Modifier
+                                            .weight(0.30f)
+                                            .padding(end = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = if (channel.channelNumber > 0) {
+                                                channel.channelNumber.toString().padStart(3, '0')
+                                            } else {
+                                                (index + 1).toString().padStart(3, '0')
+                                            },
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = if (isFocused) BroadcastCyan else TextMuted,
+                                            modifier = Modifier.width(34.dp)
+                                        )
+                                        ChannelLogoThumbnail(
+                                            title = channel.title,
+                                            logoUrl = channel.posterUrl,
+                                            modifier = Modifier.size(36.dp)
+                                        )
+                                        Spacer(Modifier.width(10.dp))
+                                        Text(
+                                            text = channel.title,
+                                            style = MaterialTheme.typography.titleSmall,
+                                            color = if (isFocused || isSelectedChannel) TextPrimary else TextSecondary,
+                                            fontWeight = if (isFocused || isSelectedChannel) FontWeight.SemiBold else FontWeight.Normal,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        if (channel.isFavorite) {
+                                            Spacer(Modifier.width(4.dp))
+                                            Icon(
+                                                imageVector = Icons.Default.Star,
+                                                contentDescription = "Favorite",
+                                                tint = SignalAmber,
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                        }
+                                    }
+
+                                    // Right Wide EPG Timeline Blocks (~70% width across 4 half-hour slots)
+                                    Row(
+                                        modifier = Modifier.weight(0.70f),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        timeSlots.forEachIndexed { slotIdx, slotStart ->
+                                            val slotEnd = slotStart + slotDurationMs
+                                            val matchingProgram = programs.firstOrNull { prog ->
+                                                prog.startTimeMs < slotEnd && prog.endTimeMs > slotStart
+                                            }
+                                            val isCurrentSlot = slotIdx == 0
+                                            val cellBg = when {
+                                                isFocused && isCurrentSlot -> BroadcastCyanDeep.copy(alpha = 0.45f)
+                                                isFocused -> ElevatedSlate
+                                                isCurrentSlot && matchingProgram != null -> MidnightPanel
+                                                else -> ObsidianVoid.copy(alpha = 0.65f)
+                                            }
+
+                                            Column(
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .height(42.dp)
+                                                    .clip(RoundedCornerShape(6.dp))
+                                                    .background(cellBg)
+                                                    .padding(horizontal = 8.dp, vertical = 5.dp),
+                                                verticalArrangement = Arrangement.Center
+                                            ) {
+                                                Text(
+                                                    text = matchingProgram?.title ?: if (isCurrentSlot) "Live Broadcast" else "—",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = when {
+                                                        matchingProgram != null && (isFocused || isCurrentSlot) -> TextPrimary
+                                                        matchingProgram != null -> TextSecondary
+                                                        else -> TextMuted.copy(alpha = 0.7f)
+                                                    },
+                                                    fontWeight = if (isCurrentSlot && matchingProgram != null) FontWeight.Medium else FontWeight.Normal,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                if (isCurrentSlot && matchingProgram != null) {
+                                                    Spacer(Modifier.height(3.dp))
+                                                    LinearProgressIndicator(
+                                                        progress = { matchingProgram.progressAt(nowMs) },
+                                                        color = BroadcastCyan,
+                                                        trackColor = ObsidianVoid.copy(alpha = 0.6f),
+                                                        modifier = Modifier
+                                                            .fillMaxWidth()
+                                                            .height(2.5.dp)
+                                                            .clip(RoundedCornerShape(2.dp))
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -614,59 +753,133 @@ fun LiveTvScreen(
                 }
             }
         }
-    }
-}
 
-@Composable
-private fun CategoryPaneRow(
-    name: String,
-    count: Int,
-    selected: Boolean,
-    onClick: () -> Unit,
-    subtitle: String? = null,
-    testTag: String
-) {
-    TvFocusableSurface(
-        onClick = onClick,
-        selected = selected,
-        focusScale = 1.03f,
-        containerColor = MidnightPanel,
-        selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.45f),
-        focusedContainerColor = HighlightSlate,
-        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
-        modifier = Modifier
-            .fillMaxWidth()
-            .testTag(testTag)
-    ) { isFocused ->
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+        // ---------------------------------------------------------------------
+        // COLLAPSIBLE GROUP SWITCHER DRAWER (ON-DEMAND OVERLAY)
+        // ---------------------------------------------------------------------
+        AnimatedVisibility(
+            visible = isGroupDrawerOpen,
+            enter = slideInHorizontally { -it } + fadeIn(),
+            exit = slideOutHorizontally { -it } + fadeOut(),
+            modifier = Modifier.fillMaxSize()
         ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = name,
-                    style = MaterialTheme.typography.titleSmall,
-                    color = if (isFocused || selected) TextPrimary else TextSecondary,
-                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                if (!subtitle.isNullOrBlank()) {
-                    Text(
-                        text = subtitle,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TextMuted,
-                        maxLines = 1
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(ObsidianVoid.copy(alpha = 0.55f))
+            ) {
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .fillMaxHeight()
+                        .width(340.dp)
+                        .background(ObsidianBase)
+                        .border(1.dp, DividerSlate.copy(alpha = 0.8f))
+                        .padding(horizontal = 16.dp, vertical = 18.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "Channel Groups",
+                            style = MaterialTheme.typography.headlineSmall,
+                            color = TextPrimary
+                        )
+                        TvBadge(text = "${groupEntries.size}")
+                    }
+                    Spacer(Modifier.height(12.dp))
+
+                    LazyColumn(
+                        state = groupListState,
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        contentPadding = PaddingValues(vertical = 4.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        itemsIndexed(groupEntries, key = { _, g -> g.id }) { idx, group ->
+                            val isSelected = group.id == selectedCategoryId
+                            TvFocusableSurface(
+                                onClick = {
+                                    onSelectCategory(group.id)
+                                    isGroupDrawerOpen = false
+                                },
+                                onFocused = {
+                                    scope.launch { groupListState.animateScrollToItem(idx) }
+                                },
+                                selected = isSelected,
+                                focusScale = 1.02f,
+                                shape = RoundedCornerShape(8.dp),
+                                containerColor = MidnightPanel,
+                                selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.38f),
+                                focusedContainerColor = HighlightSlate,
+                                focusedBorderColor = BroadcastCyan,
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 11.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .then(
+                                        if (isSelected) Modifier.focusRequester(activeGroupFocusRequester)
+                                        else Modifier
+                                    )
+                                    .onPreviewKeyEvent { keyEvent ->
+                                        if (keyEvent.type == KeyEventType.KeyDown &&
+                                            keyEvent.nativeKeyEvent.keyCode == AndroidKeyEvent.KEYCODE_DPAD_RIGHT
+                                        ) {
+                                            isGroupDrawerOpen = false
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    .testTag("live_cat_${group.id}")
+                            ) { isFocused ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = group.name,
+                                            style = MaterialTheme.typography.titleSmall,
+                                            color = if (isFocused || isSelected) TextPrimary else TextSecondary,
+                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        if (group.subtitle.isNotBlank()) {
+                                            Text(
+                                                text = group.subtitle,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = TextMuted,
+                                                maxLines = 1
+                                            )
+                                        }
+                                    }
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(
+                                        text = group.count.toString(),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = if (isSelected || isFocused) BroadcastCyan else TextMuted
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(10.dp))
+                    TvActionButton(
+                        text = "Edit Category Filter",
+                        icon = Icons.Default.FilterList,
+                        onClick = {
+                            isGroupDrawerOpen = false
+                            onReopenFilter()
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        testTag = "drawer_edit_filter_button"
                     )
                 }
             }
-            Spacer(Modifier.width(6.dp))
-            Text(
-                text = count.toString(),
-                style = MaterialTheme.typography.labelMedium,
-                color = if (selected || isFocused) BroadcastCyan else TextMuted
-            )
         }
     }
 }
@@ -679,9 +892,8 @@ fun ChannelLogoThumbnail(
 ) {
     Box(
         modifier = modifier
-            .clip(RoundedCornerShape(8.dp))
-            .background(ElevatedSlate)
-            .border(1.dp, DividerSlate, RoundedCornerShape(8.dp)),
+            .clip(RoundedCornerShape(7.dp))
+            .background(ElevatedSlate),
         contentAlignment = Alignment.Center
     ) {
         val initials = remember(title) {
@@ -693,7 +905,7 @@ fun ChannelLogoThumbnail(
         }
         Text(
             text = initials,
-            style = MaterialTheme.typography.labelMedium,
+            style = MaterialTheme.typography.labelSmall,
             color = BroadcastCyan,
             fontWeight = FontWeight.Bold
         )
@@ -704,7 +916,7 @@ fun ChannelLogoThumbnail(
                 contentScale = ContentScale.Fit,
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(4.dp)
+                    .padding(3.dp)
             )
         }
     }
@@ -763,11 +975,11 @@ private fun LivePreviewVideoPlayer(
                 modifier = Modifier
                     .align(Alignment.Center)
                     .clip(RoundedCornerShape(8.dp))
-                    .background(ObsidianVoid.copy(alpha = 0.82f))
+                    .background(ObsidianVoid.copy(alpha = 0.85f))
                     .padding(horizontal = 12.dp, vertical = 6.dp)
             ) {
                 Text(
-                    text = "Preview signal unavailable ($previewError)",
+                    text = "Preview unavailable ($previewError)",
                     style = MaterialTheme.typography.labelMedium,
                     color = SignalAmber
                 )
@@ -782,6 +994,12 @@ private fun LiveTvEmptyState(
     onGoToPlaylists: () -> Unit,
     onReopenFilter: () -> Unit
 ) {
+    val addBtnFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        delay(80L)
+        runCatching { addBtnFocus.requestFocus() }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -799,9 +1017,9 @@ private fun LiveTvEmptyState(
                 .background(
                     Brush.horizontalGradient(
                         listOf(
-                            ObsidianVoid.copy(alpha = 0.92f),
-                            ObsidianVoid.copy(alpha = 0.72f),
-                            ObsidianVoid.copy(alpha = 0.88f)
+                            ObsidianVoid.copy(alpha = 0.94f),
+                            ObsidianVoid.copy(alpha = 0.78f),
+                            ObsidianVoid.copy(alpha = 0.90f)
                         )
                     )
                 )
@@ -823,7 +1041,7 @@ private fun LiveTvEmptyState(
                 color = TextPrimary
             )
             Text(
-                text = "Connect your Stalker Portal (MAG/STB MAC + Serial + Device IDs), Xtream Codes API, M3U/M3U8 URL/File, or GitHub Gist JSON source. Use the 2-Step Country & Category Pre-Load Filter to import only the countries and channels you actually watch.",
+                text = "Connect your Stalker Portal (MAG/STB), Xtream Codes API, M3U/M3U8 URL or File, or GitHub Gist JSON playlist. Use the 2-Step Country & Category Pre-Load Filter to import only the groups you watch.",
                 style = MaterialTheme.typography.bodyLarge,
                 color = TextSecondary
             )
@@ -834,6 +1052,7 @@ private fun LiveTvEmptyState(
                     icon = Icons.Default.AddCircle,
                     isPrimary = true,
                     onClick = onGoToPlaylists,
+                    modifier = Modifier.focusRequester(addBtnFocus),
                     testTag = "empty_add_playlist_button"
                 )
                 if (hasCategories) {

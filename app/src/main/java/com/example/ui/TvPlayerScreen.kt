@@ -27,7 +27,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -119,11 +120,10 @@ private enum class TrackPickerMode { NONE, AUDIO, SUBTITLES }
 
 /**
  * Full-Screen Hardware-Accelerated Media3 TV Player:
- * - Supports HLS, DASH, RTSP, TS/Progressive over proxy-aware OkHttpDataSource
- * - Live TV: UP/DOWN zaps channels immediately with TiviMate bottom OSD banner;
- *   OK toggles transparent Channel & EPG overlay; RIGHT/MENU opens audio/subtitle/aspect controls
- * - VOD/Series: OK toggles play/pause, LEFT/RIGHT seeks -15s/+15s, auto-saves resume position
- * - Auto-Reconnect with exponential backoff & Stalker create_link refresh
+ * - Rock-solid Live Channels Overlay D-Pad focus: opening the overlay via OK/Enter immediately
+ *   moves focus to the active/first channel row; parent player does NOT swallow DPadUp/Down/Center/Enter
+ *   while overlay is open; each row auto-scrolls on focus and switches stream + closes overlay on OK/Enter.
+ * - Live TV zapping (UP/DOWN), bottom OSD banner, audio/subtitle switchers, aspect toggle, auto-reconnect.
  */
 @OptIn(UnstableApi::class)
 @Composable
@@ -143,7 +143,12 @@ fun TvPlayerScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+
     val rootFocusRequester = remember { FocusRequester() }
+    val overlayActiveItemFocus = remember { FocusRequester() }
+    val settingsFirstButtonFocus = remember { FocusRequester() }
+    val trackPickerFirstFocus = remember { FocusRequester() }
+    val overlayListState = rememberLazyListState()
 
     val isLive = item.type == ContentType.LIVE
     var showOsdBanner by remember { mutableStateOf(true) }
@@ -163,6 +168,8 @@ fun TvPlayerScreen(
     var currentPosMs by remember(item.id) { mutableLongStateOf(item.resumePositionMs) }
     var durationMs by remember(item.id) { mutableLongStateOf(item.durationMs) }
 
+    val hasAnyInteractiveOverlay = showChannelOverlay || showSettingsBar || trackPickerMode != TrackPickerMode.NONE
+
     BackHandler {
         when {
             trackPickerMode != TrackPickerMode.NONE -> trackPickerMode = TrackPickerMode.NONE
@@ -172,40 +179,59 @@ fun TvPlayerScreen(
         }
     }
 
-    // Re-show OSD whenever channel changes
+    // Re-show OSD whenever channel switches
     LaunchedEffect(item.id) {
         showOsdBanner = true
         osdTriggerToken++
     }
 
-    // Auto-hide OSD after 5 seconds when no menu overlay is open
-    LaunchedEffect(osdTriggerToken, showChannelOverlay, showSettingsBar, trackPickerMode) {
-        if (showOsdBanner && !showChannelOverlay && !showSettingsBar && trackPickerMode == TrackPickerMode.NONE) {
+    // Auto-hide OSD banner after 5s when no overlay is open
+    LaunchedEffect(osdTriggerToken, hasAnyInteractiveOverlay) {
+        if (showOsdBanner && !hasAnyInteractiveOverlay) {
             delay(5000L)
             showOsdBanner = false
         }
     }
 
-    // Request focus back to player canvas when overlays close so D-Pad zapping works seamlessly
-    LaunchedEffect(showChannelOverlay, showSettingsBar, trackPickerMode) {
-        if (!showChannelOverlay && !showSettingsBar && trackPickerMode == TrackPickerMode.NONE) {
+    // Immediately transfer focus to the active/first channel row when Live Channels Overlay opens
+    val activeOverlayTargetIndex = remember(liveZapQueue, item.id) {
+        liveZapQueue.indexOfFirst { it.id == item.id }.coerceAtLeast(0)
+    }
+
+    LaunchedEffect(showChannelOverlay) {
+        if (showChannelOverlay && liveZapQueue.isNotEmpty()) {
+            overlayListState.scrollToItem(activeOverlayTargetIndex)
+            delay(80L)
+            runCatching { overlayActiveItemFocus.requestFocus() }
+        }
+    }
+
+    // Transfer focus cleanly into Settings Bar when opened
+    LaunchedEffect(showSettingsBar, trackPickerMode) {
+        if (trackPickerMode != TrackPickerMode.NONE) {
+            delay(80L)
+            runCatching { trackPickerFirstFocus.requestFocus() }
+        } else if (showSettingsBar && !showChannelOverlay) {
+            delay(80L)
+            runCatching { settingsFirstButtonFocus.requestFocus() }
+        }
+    }
+
+    // Restore focus back to full-screen player surface whenever all overlays close
+    LaunchedEffect(hasAnyInteractiveOverlay) {
+        if (!hasAnyInteractiveOverlay) {
             delay(80L)
             runCatching { rootFocusRequester.requestFocus() }
         }
     }
 
-    // Build Media3 ExoPlayer with fast startup LoadControl and proxy-aware OkHttpDataSource
+    // Build Media3 ExoPlayer with proxy-aware OkHttpDataSource
     val exoPlayer = remember(resolvedStream?.url, resolvedStream?.headers) {
         val headers = resolvedStream?.headers.orEmpty()
         val httpClient = RoutingManager.buildHttpClient(customHeaders = headers)
         val okHttpFactory = OkHttpDataSource.Factory(httpClient)
         val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(
-                15_000,
-                50_000,
-                1_200,
-                2_500
-            )
+            .setBufferDurationsMs(15_000, 50_000, 1_200, 2_500)
             .build()
 
         ExoPlayer.Builder(context)
@@ -224,7 +250,6 @@ fun TvPlayerScreen(
             }
     }
 
-    // Track Media3 state, video resolution/codecs, tracks, and Auto-Reconnect
     DisposableEffect(exoPlayer, item.id) {
         val listener = object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
@@ -242,7 +267,7 @@ fun TvPlayerScreen(
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 if (videoSize.width > 0 && videoSize.height > 0) {
                     val resLabel = when {
-                        videoSize.height >= 2160 -> "4K UHD (${videoSize.width}×${videoSize.height})"
+                        videoSize.height >= 2160 -> "4K UHD"
                         videoSize.height >= 1080 -> "1080p FHD"
                         videoSize.height >= 720 -> "720p HD"
                         else -> "${videoSize.width}×${videoSize.height}"
@@ -330,16 +355,13 @@ fun TvPlayerScreen(
         }
     }
 
-    // Periodic progress polling & VOD resume autosave
     LaunchedEffect(exoPlayer, item.id) {
         var tick = 0
         while (true) {
             delay(1000L)
             currentPosMs = exoPlayer.currentPosition.coerceAtLeast(0L)
             val d = exoPlayer.duration
-            if (d > 0L && d != C.TIME_UNSET) {
-                durationMs = d
-            }
+            if (d > 0L && d != C.TIME_UNSET) durationMs = d
             tick++
             if (!isLive && tick % 10 == 0 && currentPosMs > 5_000L) {
                 onSaveResumePosition(item.id, currentPosMs, durationMs)
@@ -357,17 +379,25 @@ fun TvPlayerScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .focusRequester(rootFocusRequester)
-            .focusable()
             .onPreviewKeyEvent { keyEvent ->
                 if (keyEvent.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 val code = keyEvent.nativeKeyEvent.keyCode
 
-                // When an overlay is open, let Compose focus navigation operate naturally inside the overlay
-                if (showChannelOverlay || showSettingsBar || trackPickerMode != TrackPickerMode.NONE) {
+                // When an interactive overlay is open, ONLY intercept Back/Escape to dismiss it;
+                // NEVER swallow DPadUp, DPadDown, DPadLeft, DPadRight, DPadCenter, or Enter!
+                if (hasAnyInteractiveOverlay) {
+                    if (code == AndroidKeyEvent.KEYCODE_BACK || code == AndroidKeyEvent.KEYCODE_ESCAPE) {
+                        when {
+                            trackPickerMode != TrackPickerMode.NONE -> trackPickerMode = TrackPickerMode.NONE
+                            showSettingsBar -> showSettingsBar = false
+                            showChannelOverlay -> showChannelOverlay = false
+                        }
+                        return@onPreviewKeyEvent true
+                    }
                     return@onPreviewKeyEvent false
                 }
 
+                // No overlay is open: handle full-screen playback D-Pad shortcuts cleanly
                 when (code) {
                     AndroidKeyEvent.KEYCODE_DPAD_UP,
                     AndroidKeyEvent.KEYCODE_CHANNEL_UP -> {
@@ -397,7 +427,7 @@ fun TvPlayerScreen(
                     AndroidKeyEvent.KEYCODE_ENTER,
                     AndroidKeyEvent.KEYCODE_NUMPAD_ENTER -> {
                         if (isLive) {
-                            showChannelOverlay = !showChannelOverlay
+                            showChannelOverlay = true
                             showOsdBanner = true
                             osdTriggerToken++
                         } else {
@@ -441,7 +471,7 @@ fun TvPlayerScreen(
 
                     AndroidKeyEvent.KEYCODE_MENU,
                     AndroidKeyEvent.KEYCODE_INFO -> {
-                        showSettingsBar = !showSettingsBar
+                        showSettingsBar = true
                         showOsdBanner = true
                         osdTriggerToken++
                         true
@@ -452,31 +482,40 @@ fun TvPlayerScreen(
             }
             .testTag("tv_player_root")
     ) {
-        // Hardware-Accelerated Media3 Video Surface
-        AndroidView(
-            factory = { ctx ->
-                PlayerView(ctx).apply {
-                    useController = false
-                    keepScreenOn = true
-                    player = exoPlayer
-                    resizeMode = mapAspectMode(aspectMode)
-                }
-            },
-            update = { view ->
-                view.player = exoPlayer
-                view.resizeMode = mapAspectMode(aspectMode)
-            },
-            modifier = Modifier.fillMaxSize()
-        )
+        // Dedicated focus anchor for full-screen video when no overlay is open
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .focusRequester(rootFocusRequester)
+                .focusable(enabled = !hasAnyInteractiveOverlay)
+        ) {
+            AndroidView(
+                factory = { ctx ->
+                    PlayerView(ctx).apply {
+                        useController = false
+                        keepScreenOn = true
+                        isFocusable = false
+                        isFocusableInTouchMode = false
+                        player = exoPlayer
+                        resizeMode = mapAspectMode(aspectMode)
+                    }
+                },
+                update = { view ->
+                    view.player = exoPlayer
+                    view.resizeMode = mapAspectMode(aspectMode)
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
 
         // Buffering / Resolving / Reconnecting Center Pill
         if (isResolvingStream || isBuffering || playbackError != null || resolveError != null) {
             Box(
                 modifier = Modifier
                     .align(Alignment.Center)
-                    .clip(RoundedCornerShape(14.dp))
+                    .clip(RoundedCornerShape(12.dp))
                     .background(ObsidianVoid.copy(alpha = 0.88f))
-                    .border(1.5.dp, DividerSlate, RoundedCornerShape(14.dp))
+                    .border(1.dp, DividerSlate, RoundedCornerShape(12.dp))
                     .padding(horizontal = 24.dp, vertical = 16.dp)
             ) {
                 Row(
@@ -487,23 +526,23 @@ fun TvPlayerScreen(
                         CircularProgressIndicator(
                             color = BroadcastCyan,
                             strokeWidth = 3.dp,
-                            modifier = Modifier.size(26.dp)
+                            modifier = Modifier.size(24.dp)
                         )
                     }
                     Column {
                         val statusText = when {
-                            isResolvingStream -> "Resolving secure stream link..."
+                            isResolvingStream -> "Resolving stream..."
                             resolveError != null -> "Stream Error: $resolveError"
-                            playbackError != null && reconnectAttempt <= 5 -> "Reconnecting stream (Attempt $reconnectAttempt/5)..."
+                            playbackError != null && reconnectAttempt <= 5 -> "Reconnecting (Attempt $reconnectAttempt/5)..."
                             playbackError != null -> "Playback Failed ($playbackError)"
-                            else -> "Buffering stream..."
+                            else -> "Buffering..."
                         }
                         Text(statusText, style = MaterialTheme.typography.titleMedium, color = TextPrimary)
                         if (resolveError != null || (playbackError != null && reconnectAttempt >= 5)) {
                             Spacer(Modifier.height(8.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 TvActionButton(
-                                    text = "Retry Stream",
+                                    text = "Retry",
                                     icon = Icons.Default.Refresh,
                                     isPrimary = true,
                                     onClick = {
@@ -513,7 +552,7 @@ fun TvPlayerScreen(
                                     }
                                 )
                                 TvActionButton(
-                                    text = "Exit Player",
+                                    text = "Exit",
                                     icon = Icons.AutoMirrored.Filled.ArrowBack,
                                     onClick = onExitPlayer
                                 )
@@ -524,35 +563,23 @@ fun TvPlayerScreen(
             }
         }
 
-        // Top-Right Quick Status Badge (Aspect Ratio + Remote Hints)
+        // Top-Right Compact Aspect Badge
         AnimatedVisibility(
             visible = showOsdBanner || showSettingsBar,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier
                 .align(Alignment.TopEnd)
-                .padding(24.dp)
+                .padding(22.dp)
         ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TvBadge(text = "ASPECT: ${aspectMode.label}", containerColor = ObsidianVoid.copy(alpha = 0.85f))
-                if (isLive) {
-                    TvBadge(
-                        text = "▲▼ ZAP • OK GUIDE • ▶ TRACKS",
-                        containerColor = ObsidianVoid.copy(alpha = 0.85f),
-                        contentColor = TextSecondary
-                    )
-                } else {
-                    TvBadge(
-                        text = "◀▶ SEEK 15s • OK PLAY/PAUSE • ▲▼ TRACKS",
-                        containerColor = ObsidianVoid.copy(alpha = 0.85f),
-                        contentColor = TextSecondary
-                    )
-                }
-            }
+            TvBadge(
+                text = "ASPECT: ${aspectMode.label}",
+                containerColor = ObsidianVoid.copy(alpha = 0.82f)
+            )
         }
 
         // ---------------------------------------------------------------------
-        // TRANSPARENT LIVE TV CHANNEL & EPG OVERLAY DRAWER (TOGGLED BY OK)
+        // LIVE CHANNELS OVERLAY DRAWER (FIXED D-PAD FOCUS & SELECTION)
         // ---------------------------------------------------------------------
         AnimatedVisibility(
             visible = isLive && showChannelOverlay,
@@ -561,33 +588,51 @@ fun TvPlayerScreen(
             modifier = Modifier
                 .align(Alignment.CenterStart)
                 .fillMaxHeight()
-                .width(420.dp)
+                .width(430.dp)
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(ObsidianVoid.copy(alpha = 0.88f))
-                    .border(1.dp, DividerSlate.copy(alpha = 0.7f))
-                    .padding(18.dp)
+                    .background(ObsidianVoid.copy(alpha = 0.90f))
+                    .border(1.dp, DividerSlate.copy(alpha = 0.6f))
+                    .padding(horizontal = 16.dp, vertical = 18.dp)
+                    .testTag("live_channels_overlay")
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text("Live Channels Overlay", style = MaterialTheme.typography.titleLarge, color = TextPrimary)
+                    Column {
+                        Text(
+                            text = "Live Channels",
+                            style = MaterialTheme.typography.titleLarge,
+                            color = TextPrimary
+                        )
+                        Text(
+                            text = "${liveZapQueue.size} channels • Back to close",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextMuted
+                        )
+                    }
                     TvActionButton(
                         text = "Close",
                         onClick = { showChannelOverlay = false },
                         testTag = "player_overlay_close_button"
                     )
                 }
+
                 Spacer(Modifier.height(12.dp))
+
                 LazyColumn(
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    contentPadding = PaddingValues(4.dp)
+                    state = overlayListState,
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    contentPadding = PaddingValues(vertical = 4.dp),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .testTag("live_channels_overlay_list")
                 ) {
-                    items(liveZapQueue, key = { it.id }) { ch ->
+                    itemsIndexed(liveZapQueue, key = { _, ch -> ch.id }) { index, ch ->
                         val chEpgKey = ch.epgChannelId.ifBlank { ch.id }
                         val chNow = epgByChannelId[chEpgKey]?.firstOrNull { it.isCurrentAt(nowMs) }
                             ?: epgByChannelId[chEpgKey]?.firstOrNull()
@@ -595,22 +640,49 @@ fun TvPlayerScreen(
 
                         TvFocusableSurface(
                             onClick = {
-                                onSwitchLiveChannel(ch)
                                 showChannelOverlay = false
+                                if (ch.id != item.id) {
+                                    onSwitchLiveChannel(ch)
+                                }
+                            },
+                            onFocused = {
+                                scope.launch {
+                                    overlayListState.animateScrollToItem(index)
+                                }
                             },
                             selected = isCurrent,
-                            focusScale = 1.03f,
-                            containerColor = MidnightPanel.copy(alpha = 0.85f),
-                            selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.55f),
+                            focusScale = 1.025f,
+                            shape = RoundedCornerShape(8.dp),
+                            containerColor = ObsidianBase.copy(alpha = 0.82f),
+                            selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.42f),
                             focusedContainerColor = HighlightSlate,
+                            borderColor = Color.Transparent,
+                            focusedBorderColor = BroadcastCyan,
+                            focusedBorderWidth = 2.dp,
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .then(
+                                    if (index == activeOverlayTargetIndex) {
+                                        Modifier.focusRequester(overlayActiveItemFocus)
+                                    } else {
+                                        Modifier
+                                    }
+                                )
+                                .testTag("overlay_channel_${ch.id}")
+                        ) { isFocused ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
                                 Text(
-                                    text = if (ch.channelNumber > 0) ch.channelNumber.toString().padStart(3, '0') else "---",
+                                    text = if (ch.channelNumber > 0) {
+                                        ch.channelNumber.toString().padStart(3, '0')
+                                    } else {
+                                        (index + 1).toString().padStart(3, '0')
+                                    },
                                     style = MaterialTheme.typography.labelMedium,
-                                    color = BroadcastCyan,
+                                    color = if (isFocused || isCurrent) BroadcastCyan else TextMuted,
                                     modifier = Modifier.width(34.dp)
                                 )
                                 ChannelLogoThumbnail(
@@ -623,16 +695,26 @@ fun TvPlayerScreen(
                                     Text(
                                         text = ch.title,
                                         style = MaterialTheme.typography.titleSmall,
-                                        color = TextPrimary,
+                                        color = if (isFocused || isCurrent) TextPrimary else TextSecondary,
+                                        fontWeight = if (isFocused || isCurrent) FontWeight.Bold else FontWeight.Medium,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     Text(
                                         text = chNow?.title ?: "Live Stream",
                                         style = MaterialTheme.typography.bodySmall,
-                                        color = TextMuted,
+                                        color = if (isFocused) TextSecondary else TextMuted,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                if (isCurrent) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Box(
+                                        modifier = Modifier
+                                            .size(8.dp)
+                                            .clip(CircleShape)
+                                            .background(BroadcastCyan)
                                     )
                                 }
                             }
@@ -646,7 +728,7 @@ fun TvPlayerScreen(
         // BOTTOM TIVIMATE OSD BANNER + PLAYER CONTROLS BAR
         // ---------------------------------------------------------------------
         AnimatedVisibility(
-            visible = showOsdBanner || showSettingsBar,
+            visible = (showOsdBanner || showSettingsBar) && !showChannelOverlay,
             enter = slideInVertically { it } + fadeIn(),
             exit = slideOutVertically { it } + fadeOut(),
             modifier = Modifier
@@ -660,15 +742,14 @@ fun TvPlayerScreen(
                         Brush.verticalGradient(
                             listOf(
                                 Color.Transparent,
-                                ObsidianVoid.copy(alpha = 0.90f),
-                                ObsidianVoid.copy(alpha = 0.97f)
+                                ObsidianVoid.copy(alpha = 0.88f),
+                                ObsidianVoid.copy(alpha = 0.96f)
                             )
                         )
                     )
-                    .padding(horizontal = 32.dp, vertical = 22.dp),
+                    .padding(horizontal = 32.dp, vertical = 20.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                // Main Channel / Media Banner Row
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
@@ -677,7 +758,7 @@ fun TvPlayerScreen(
                         ChannelLogoThumbnail(
                             title = item.title,
                             logoUrl = item.posterUrl,
-                            modifier = Modifier.size(62.dp)
+                            modifier = Modifier.size(58.dp)
                         )
                         Spacer(Modifier.width(16.dp))
                     }
@@ -697,9 +778,9 @@ fun TvPlayerScreen(
                             if (isLive) {
                                 Row(
                                     modifier = Modifier
-                                        .clip(RoundedCornerShape(6.dp))
+                                        .clip(RoundedCornerShape(5.dp))
                                         .background(LiveCrimson)
-                                        .padding(horizontal = 8.dp, vertical = 3.dp),
+                                        .padding(horizontal = 7.dp, vertical = 3.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Box(Modifier.size(6.dp).clip(CircleShape).background(Color.White))
@@ -727,7 +808,7 @@ fun TvPlayerScreen(
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Text(
-                                        text = "NOW: ${currentProgram.title} (${timeFmt.format(Date(currentProgram.startTimeMs))} - ${timeFmt.format(Date(currentProgram.endTimeMs))})",
+                                        text = "${currentProgram.title}  (${timeFmt.format(Date(currentProgram.startTimeMs))} – ${timeFmt.format(Date(currentProgram.endTimeMs))})",
                                         style = MaterialTheme.typography.titleSmall,
                                         color = BroadcastCyan,
                                         maxLines = 1,
@@ -737,7 +818,7 @@ fun TvPlayerScreen(
                                     if (nextProgram != null) {
                                         Spacer(Modifier.width(14.dp))
                                         Text(
-                                            text = "NEXT: ${nextProgram.title}",
+                                            text = "Next: ${nextProgram.title}",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = TextMuted,
                                             maxLines = 1,
@@ -757,13 +838,12 @@ fun TvPlayerScreen(
                                 )
                             } else {
                                 Text(
-                                    text = "Live Broadcast Stream • Use ▲/▼ to zap channels",
+                                    text = "Live Broadcast",
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = TextSecondary
                                 )
                             }
                         } else {
-                            // VOD / Series Timeline Bar
                             val progress = if (durationMs > 0L) {
                                 (currentPosMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
                             } else 0f
@@ -789,10 +869,9 @@ fun TvPlayerScreen(
 
                     Spacer(Modifier.width(18.dp))
 
-                    // Technical Stream Telemetry Badges (Resolution / Video Codec / Audio Codec / Bitrate)
                     Column(
                         horizontalAlignment = Alignment.End,
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                        verticalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             if (techInfo.resolution.isNotBlank()) TvBadge(text = techInfo.resolution)
@@ -806,7 +885,6 @@ fun TvPlayerScreen(
                     }
                 }
 
-                // Interactive D-Pad Player Settings & Transport Controls Bar
                 if (showSettingsBar) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -818,6 +896,7 @@ fun TvPlayerScreen(
                             icon = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                             isPrimary = true,
                             onClick = { if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play() },
+                            modifier = Modifier.focusRequester(settingsFirstButtonFocus),
                             testTag = "player_play_pause_button"
                         )
                         if (!isLive) {
@@ -879,7 +958,7 @@ fun TvPlayerScreen(
         }
 
         // ---------------------------------------------------------------------
-        // AUDIO / SUBTITLE TRACK SWITCHER MODAL OVERLAY
+        // AUDIO / SUBTITLE TRACK SWITCHER OVERLAY
         // ---------------------------------------------------------------------
         if (trackPickerMode != TrackPickerMode.NONE) {
             val isAudio = trackPickerMode == TrackPickerMode.AUDIO
@@ -891,7 +970,7 @@ fun TvPlayerScreen(
                     .fillMaxHeight()
                     .width(380.dp)
                     .background(ObsidianVoid.copy(alpha = 0.94f))
-                    .border(1.5.dp, BroadcastCyan.copy(alpha = 0.6f))
+                    .border(1.dp, DividerSlate)
                     .padding(20.dp)
             ) {
                 Column(modifier = Modifier.fillMaxSize()) {
@@ -905,7 +984,11 @@ fun TvPlayerScreen(
                             style = MaterialTheme.typography.titleLarge,
                             color = TextPrimary
                         )
-                        TvActionButton(text = "Done", onClick = { trackPickerMode = TrackPickerMode.NONE })
+                        TvActionButton(
+                            text = "Done",
+                            onClick = { trackPickerMode = TrackPickerMode.NONE },
+                            modifier = if (options.isEmpty() && isAudio) Modifier.focusRequester(trackPickerFirstFocus) else Modifier
+                        )
                     }
                     Spacer(Modifier.height(14.dp))
 
@@ -921,7 +1004,8 @@ fun TvPlayerScreen(
                                             .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
                                             .build()
                                         trackPickerMode = TrackPickerMode.NONE
-                                    }
+                                    },
+                                    modifier = Modifier.focusRequester(trackPickerFirstFocus)
                                 )
                             }
                         }
@@ -936,7 +1020,7 @@ fun TvPlayerScreen(
                                 )
                             }
                         } else {
-                            items(options, key = { "${it.groupIndex}_${it.trackIndex}" }) { track ->
+                            itemsIndexed(options, key = { _, t -> "${t.groupIndex}_${t.trackIndex}" }) { idx, track ->
                                 TvCheckboxRow(
                                     title = track.label,
                                     subtitle = track.language,
@@ -957,7 +1041,8 @@ fun TvPlayerScreen(
                                                 .build()
                                         }
                                         trackPickerMode = TrackPickerMode.NONE
-                                    }
+                                    },
+                                    modifier = if (isAudio && idx == 0) Modifier.focusRequester(trackPickerFirstFocus) else Modifier
                                 )
                             }
                         }

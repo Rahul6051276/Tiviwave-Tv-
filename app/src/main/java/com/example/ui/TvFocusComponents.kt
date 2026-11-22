@@ -20,7 +20,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -82,9 +81,9 @@ fun isTvConfirmKey(nativeKeyCode: Int): Boolean {
 }
 
 /**
- * Core Android TV D-Pad Focusable Container.
- * Renders an unmistakable 10-foot TV focus indicator: crisp glowing cyan border + smooth scale zoom
- * + elevated zIndex so focused cards never clip behind neighbors.
+ * Clean Android TV D-Pad Focusable Container.
+ * Uses subtle resting surfaces without heavy clutter borders, and highlights the focused element
+ * with a crisp 2dp TV focus ring + smooth scale zoom + elevated zIndex.
  */
 @Composable
 fun TvFocusableSurface(
@@ -93,13 +92,14 @@ fun TvFocusableSurface(
     onFocused: (() -> Unit)? = null,
     selected: Boolean = false,
     enabled: Boolean = true,
-    focusScale: Float = 1.04f,
-    shape: Shape = RoundedCornerShape(12.dp),
+    focusScale: Float = 1.03f,
+    shape: Shape = RoundedCornerShape(10.dp),
     containerColor: Color = MidnightPanel,
     selectedContainerColor: Color = HighlightSlate,
-    focusedContainerColor: Color = ElevatedSlate,
-    borderColor: Color = DividerSlate.copy(alpha = 0.55f),
+    focusedContainerColor: Color = HighlightSlate,
+    borderColor: Color = Color.Transparent,
     focusedBorderColor: Color = BroadcastCyan,
+    focusedBorderWidth: Dp = 2.dp,
     contentPadding: PaddingValues = PaddingValues(12.dp),
     content: @Composable BoxScope.(isFocused: Boolean) -> Unit
 ) {
@@ -107,7 +107,7 @@ fun TvFocusableSurface(
 
     val scale by animateFloatAsState(
         targetValue = if (isFocused) focusScale else 1f,
-        animationSpec = spring(stiffness = Spring.StiffnessMediumLow, dampingRatio = 0.78f),
+        animationSpec = spring(stiffness = Spring.StiffnessMedium, dampingRatio = 0.82f),
         label = "tv_focus_scale"
     )
     val animatedBg by animateColorAsState(
@@ -121,18 +121,23 @@ fun TvFocusableSurface(
     val animatedBorder by animateColorAsState(
         targetValue = when {
             isFocused -> focusedBorderColor
-            selected -> BroadcastCyan.copy(alpha = 0.5f)
+            selected -> BroadcastCyan.copy(alpha = 0.35f)
             else -> borderColor
         },
         label = "tv_focus_border"
     )
-    val borderWidth: Dp = if (isFocused) 3.dp else if (selected) 1.5.dp else 1.dp
+    val borderStroke = when {
+        isFocused -> BorderStroke(focusedBorderWidth, animatedBorder)
+        selected -> BorderStroke(1.dp, animatedBorder)
+        borderColor != Color.Transparent -> BorderStroke(0.75.dp, animatedBorder)
+        else -> null
+    }
 
     Surface(
         shape = shape,
         color = animatedBg,
-        border = BorderStroke(borderWidth, animatedBorder),
-        shadowElevation = if (isFocused) 12.dp else 2.dp,
+        border = borderStroke,
+        shadowElevation = if (isFocused) 10.dp else 0.dp,
         modifier = modifier
             .zIndex(if (isFocused) 4f else 0f)
             .scale(scale)
@@ -143,7 +148,11 @@ fun TvFocusableSurface(
                 if (nowFocused) onFocused?.invoke()
             }
             .onKeyEvent { keyEvent ->
-                if (enabled && keyEvent.type == KeyEventType.KeyUp && isTvConfirmKey(keyEvent.nativeKeyEvent.keyCode)) {
+                if (enabled &&
+                    keyEvent.type == KeyEventType.KeyDown &&
+                    keyEvent.nativeKeyEvent.repeatCount == 0 &&
+                    isTvConfirmKey(keyEvent.nativeKeyEvent.keyCode)
+                ) {
                     onClick()
                     true
                 } else {
@@ -186,17 +195,18 @@ fun TvActionButton(
         isPrimary -> BroadcastCyan
         else -> HighlightSlate
     }
-    val focusedBorder = if (isDanger) Color.White else Color.White
+    val focusedBorder = Color.White.copy(alpha = 0.9f)
 
     TvFocusableSurface(
         onClick = onClick,
         enabled = enabled,
-        focusScale = 1.05f,
+        focusScale = 1.04f,
         shape = RoundedCornerShape(10.dp),
         containerColor = baseContainer,
         focusedContainerColor = focusedContainer,
+        borderColor = DividerSlate.copy(alpha = 0.5f),
         focusedBorderColor = focusedBorder,
-        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
         modifier = if (testTag.isNotBlank()) modifier.testTag(testTag) else modifier
     ) { isFocused ->
         val contentColor = when {
@@ -213,20 +223,24 @@ fun TvActionButton(
             if (icon != null) {
                 Icon(
                     imageVector = icon,
-                    contentDescription = text,
+                    contentDescription = text.ifBlank { "Action" },
                     tint = contentColor,
-                    modifier = Modifier.size(20.dp)
+                    modifier = Modifier.size(18.dp)
                 )
-                Spacer(Modifier.width(8.dp))
+                if (text.isNotBlank()) {
+                    Spacer(Modifier.width(8.dp))
+                }
             }
-            Text(
-                text = text,
-                style = MaterialTheme.typography.labelLarge,
-                color = contentColor,
-                fontWeight = if (isFocused || isPrimary) FontWeight.Bold else FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            if (text.isNotBlank()) {
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = contentColor,
+                    fontWeight = if (isFocused || isPrimary) FontWeight.Bold else FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
     }
 }
@@ -247,9 +261,10 @@ fun TvCheckboxRow(
         focusScale = 1.02f,
         shape = RoundedCornerShape(10.dp),
         containerColor = MidnightPanel,
-        selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.26f),
+        selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.24f),
         focusedContainerColor = HighlightSlate,
-        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+        borderColor = DividerSlate.copy(alpha = 0.35f),
+        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 11.dp),
         modifier = modifier
             .fillMaxWidth()
             .then(if (testTag.isNotBlank()) Modifier.testTag(testTag) else Modifier)
@@ -266,7 +281,7 @@ fun TvCheckboxRow(
                     isFocused -> TextPrimary
                     else -> TextMuted
                 },
-                modifier = Modifier.size(24.dp)
+                modifier = Modifier.size(22.dp)
             )
             Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
@@ -292,7 +307,7 @@ fun TvCheckboxRow(
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(6.dp))
-                        .background(if (checked) BroadcastCyan.copy(alpha = 0.2f) else ElevatedSlate)
+                        .background(if (checked) BroadcastCyan.copy(alpha = 0.18f) else ElevatedSlate)
                         .padding(horizontal = 8.dp, vertical = 4.dp)
                 ) {
                     Text(
@@ -332,7 +347,7 @@ fun TvTextField(
                 .clip(RoundedCornerShape(10.dp))
                 .background(if (isFocused) HighlightSlate else MidnightPanel)
                 .border(
-                    width = if (isFocused) 2.5.dp else 1.dp,
+                    width = if (isFocused) 2.dp else 1.dp,
                     color = if (isFocused) BroadcastCyan else DividerSlate,
                     shape = RoundedCornerShape(10.dp)
                 )
@@ -379,7 +394,6 @@ fun TvBadge(
         modifier = modifier
             .clip(RoundedCornerShape(6.dp))
             .background(containerColor)
-            .border(1.dp, contentColor.copy(alpha = 0.35f), RoundedCornerShape(6.dp))
             .padding(horizontal = 8.dp, vertical = 3.dp)
     ) {
         Text(

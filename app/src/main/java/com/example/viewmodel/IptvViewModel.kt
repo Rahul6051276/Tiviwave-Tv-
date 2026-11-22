@@ -306,7 +306,7 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
                         selectedLiveCategoryId = "ALL",
                         selectedVodCategoryId = "ALL",
                         selectedSeriesCategoryId = "ALL",
-                        bannerMessage = "Imported $importedCount items across $selectedCount selected categories."
+                        bannerMessage = null
                     )
                 }
                 refreshEpgForPlaylist(source)

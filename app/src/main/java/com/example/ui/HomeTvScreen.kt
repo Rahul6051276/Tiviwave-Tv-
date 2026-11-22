@@ -50,6 +50,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -57,6 +58,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -478,6 +481,12 @@ private fun PlaylistsAndFilterManagerScreen(
         }
     }
 
+    val firstSourceChipFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(70L)
+        runCatching { firstSourceChipFocus.requestFocus() }
+    }
+
     Row(
         modifier = Modifier
             .fillMaxSize()
@@ -509,7 +518,7 @@ private fun PlaylistsAndFilterManagerScreen(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                SourceType.entries.forEach { type ->
+                SourceType.entries.forEachIndexed { idx, type ->
                     val shortLabel = when (type) {
                         SourceType.STALKER -> "Stalker MAG"
                         SourceType.XTREAM -> "Xtream"
@@ -528,7 +537,9 @@ private fun PlaylistsAndFilterManagerScreen(
                         selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.55f),
                         focusedContainerColor = BroadcastCyan,
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 9.dp),
-                        modifier = Modifier.testTag("source_type_${type.name.lowercase()}")
+                        modifier = Modifier
+                            .then(if (idx == 0) Modifier.focusRequester(firstSourceChipFocus) else Modifier)
+                            .testTag("source_type_${type.name.lowercase()}")
                     ) { isFocused ->
                         Text(
                             text = shortLabel,
@@ -880,6 +891,12 @@ private fun CountryProxyRoutingScreen(
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var formError by remember { mutableStateOf<String?>(null) }
+    val routingEntryFocus = remember { FocusRequester() }
+
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(70L)
+        runCatching { routingEntryFocus.requestFocus() }
+    }
 
     Column(
         modifier = Modifier
@@ -930,6 +947,7 @@ private fun CountryProxyRoutingScreen(
                     text = if (routingState.useVpnTunnel) "Mode: VPN + OkHttp" else "Mode: App Proxy Only",
                     icon = Icons.Default.VpnKey,
                     onClick = { onToggleVpnMode(!routingState.useVpnTunnel) },
+                    modifier = Modifier.focusRequester(routingEntryFocus),
                     testTag = "routing_mode_toggle_button"
                 )
                 if (routingState.isConnected || routingState.isConnecting) {
@@ -1216,41 +1234,45 @@ private fun GlobalBusyAndStatusOverlay(
     errorMessage: String?,
     onDismissBanner: () -> Unit
 ) {
+    val activeMsg = errorMessage ?: bannerMessage
+
+    androidx.compose.runtime.LaunchedEffect(activeMsg) {
+        if (!activeMsg.isNullOrBlank()) {
+            kotlinx.coroutines.delay(if (errorMessage != null) 4500L else 2800L)
+            onDismissBanner()
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
-        // Top-right Toast Banner
-        val activeMsg = errorMessage ?: bannerMessage
         AnimatedVisibility(
             visible = !activeMsg.isNullOrBlank(),
             modifier = Modifier
                 .align(Alignment.TopEnd)
-                .padding(24.dp)
+                .padding(20.dp)
         ) {
             val isErr = errorMessage != null
-            TvFocusableSurface(
-                onClick = onDismissBanner,
-                containerColor = if (isErr) LiveCrimson.copy(alpha = 0.92f) else ElevatedSlate,
-                focusedContainerColor = if (isErr) LiveCrimson else HighlightSlate,
-                borderColor = if (isErr) Color.White else BroadcastCyan,
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text(
-                        text = activeMsg.orEmpty(),
-                        style = MaterialTheme.typography.titleSmall,
-                        color = TextPrimary,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.width(380.dp)
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(if (isErr) LiveCrimson.copy(alpha = 0.92f) else ElevatedSlate.copy(alpha = 0.95f))
+                    .border(
+                        1.dp,
+                        if (isErr) Color.White.copy(alpha = 0.5f) else DividerSlate,
+                        RoundedCornerShape(10.dp)
                     )
-                    Text("OK", style = MaterialTheme.typography.labelMedium, color = BroadcastCyan)
-                }
+                    .padding(horizontal = 16.dp, vertical = 10.dp)
+            ) {
+                Text(
+                    text = activeMsg.orEmpty(),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextPrimary,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.width(360.dp)
+                )
             }
         }
 
-        // Full-Screen Busy Progress Modal
         if (isBusy) {
             Box(
                 modifier = Modifier
@@ -1260,14 +1282,14 @@ private fun GlobalBusyAndStatusOverlay(
             ) {
                 Row(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(MidnightPanel)
-                        .border(1.5.dp, BroadcastCyan, RoundedCornerShape(16.dp))
-                        .padding(horizontal = 28.dp, vertical = 22.dp),
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(ObsidianBase)
+                        .border(1.dp, DividerSlate, RoundedCornerShape(14.dp))
+                        .padding(horizontal = 28.dp, vertical = 20.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(18.dp)
                 ) {
-                    CircularProgressIndicator(color = BroadcastCyan, strokeWidth = 3.dp, modifier = Modifier.size(32.dp))
+                    CircularProgressIndicator(color = BroadcastCyan, strokeWidth = 3.dp, modifier = Modifier.size(30.dp))
                     Text(
                         text = busyMessage.ifBlank { "Working..." },
                         style = MaterialTheme.typography.titleMedium,

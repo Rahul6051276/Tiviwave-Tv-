@@ -22,8 +22,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -45,10 +47,13 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
@@ -76,11 +81,15 @@ import com.example.ui.theme.SignalAmber
 import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.util.Locale
 
 /**
- * TV 2:3 Poster Grid for Movies (VOD) and Web Series with D-Pad Focus Zoom,
- * Selected Category Filter Pills, Resume Progress Indicators, and Details View.
+ * TV 5-Column 2:3 Poster Grid for Movies (VOD) and Web Series:
+ * - Strictly 5 columns per row (GridCells.Fixed(5)) on Android TV landscape screens.
+ * - Readable rating badges & concise titles at 5-column density.
+ * - Predictable FocusRequester entry point, auto-scroll on focus, and crisp D-Pad zoom.
  */
 @Composable
 fun VodOrSeriesGridScreen(
@@ -119,29 +128,42 @@ fun VodOrSeriesGridScreen(
         return
     }
 
+    val gridState = rememberLazyGridState()
+    val firstPosterFocus = remember { FocusRequester() }
+    val firstPillFocus = remember { FocusRequester() }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(contentType, selectedCategoryId, filteredItems.isNotEmpty()) {
+        delay(70L)
+        if (filteredItems.isNotEmpty()) {
+            runCatching { firstPosterFocus.requestFocus() }
+        } else {
+            runCatching { firstPillFocus.requestFocus() }
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(ObsidianVoid)
-            .padding(horizontal = 24.dp, vertical = 18.dp)
+            .padding(horizontal = 24.dp, vertical = 16.dp)
     ) {
-        // Header Bar
+        // Header Row
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Column {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 Text(
                     text = contentType.label,
                     style = MaterialTheme.typography.headlineMedium,
                     color = TextPrimary
                 )
-                Text(
-                    text = "${filteredItems.size} titles • Showing selected categories only",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = TextMuted
-                )
+                TvBadge(text = "${filteredItems.size} titles")
             }
             TvActionButton(
                 text = "Edit Categories",
@@ -151,25 +173,26 @@ fun VodOrSeriesGridScreen(
             )
         }
 
-        Spacer(Modifier.height(14.dp))
+        Spacer(Modifier.height(12.dp))
 
-        // Horizontal Category Filter Strip
+        // Horizontal Category Filter Chips
         LazyRow(
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
             contentPadding = PaddingValues(vertical = 4.dp)
         ) {
             item(key = "pill_all") {
                 CategoryFilterPill(
                     label = "All (${typeItems.size})",
                     selected = selectedCategoryId == "ALL",
-                    onClick = { onSelectCategory("ALL") }
+                    onClick = { onSelectCategory("ALL") },
+                    modifier = Modifier.focusRequester(firstPillFocus)
                 )
             }
             val continueCount = typeItems.count { it.resumePositionMs > 5_000L }
             if (continueCount > 0) {
                 item(key = "pill_continue") {
                     CategoryFilterPill(
-                        label = "Continue Watching ($continueCount)",
+                        label = "Continue ($continueCount)",
                         selected = selectedCategoryId == "CONTINUE",
                         onClick = { onSelectCategory("CONTINUE") }
                     )
@@ -191,20 +214,29 @@ fun VodOrSeriesGridScreen(
             }
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(14.dp))
 
-        // 2:3 Poster Grid with D-Pad Focus Zoom
+        // Strict 5-Column 2:3 Poster Grid for 10-Foot Android TV
         LazyVerticalGrid(
-            columns = GridCells.Adaptive(minSize = 154.dp),
-            horizontalArrangement = Arrangement.spacedBy(18.dp),
-            verticalArrangement = Arrangement.spacedBy(20.dp),
-            contentPadding = PaddingValues(6.dp),
-            modifier = Modifier.fillMaxSize()
+            state = gridState,
+            columns = GridCells.Fixed(5),
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp),
+            modifier = Modifier
+                .fillMaxSize()
+                .testTag("${contentType.name.lowercase()}_poster_grid")
         ) {
-            items(filteredItems, key = { it.id }) { item ->
+            itemsIndexed(filteredItems, key = { _, item -> item.id }) { index, item ->
                 TvPosterCard(
                     item = item,
                     onClick = { onSelectItem(item) },
+                    onFocused = {
+                        scope.launch {
+                            gridState.animateScrollToItem(index)
+                        }
+                    },
+                    modifier = if (index == 0) Modifier.focusRequester(firstPosterFocus) else Modifier,
                     testTag = "poster_${item.id}"
                 )
             }
@@ -221,6 +253,14 @@ fun FavoritesScreen(
     val favoriteItems = remember(allItems) { allItems.filter { it.isFavorite } }
     val favLive = remember(favoriteItems) { favoriteItems.filter { it.type == ContentType.LIVE } }
     val favVodAndSeries = remember(favoriteItems) { favoriteItems.filter { it.type != ContentType.LIVE } }
+    val firstFavFocus = remember { FocusRequester() }
+
+    LaunchedEffect(favoriteItems.isNotEmpty()) {
+        if (favoriteItems.isNotEmpty()) {
+            delay(70L)
+            runCatching { firstFavFocus.requestFocus() }
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -228,25 +268,25 @@ fun FavoritesScreen(
             .background(ObsidianVoid)
             .padding(horizontal = 24.dp, vertical = 18.dp)
     ) {
-        Text(
-            text = "Favorites",
-            style = MaterialTheme.typography.headlineMedium,
-            color = TextPrimary
-        )
-        Text(
-            text = "${favoriteItems.size} saved channels, movies, and series",
-            style = MaterialTheme.typography.bodyMedium,
-            color = TextMuted
-        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                text = "Favorites",
+                style = MaterialTheme.typography.headlineMedium,
+                color = TextPrimary
+            )
+            TvBadge(text = "${favoriteItems.size} saved")
+        }
         Spacer(Modifier.height(16.dp))
 
         if (favoriteItems.isEmpty()) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(ObsidianBase)
-                    .border(1.dp, DividerSlate, RoundedCornerShape(16.dp)),
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(ObsidianBase),
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -268,26 +308,30 @@ fun FavoritesScreen(
                         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text("Favorite Live Channels", style = MaterialTheme.typography.titleLarge, color = BroadcastCyan)
                             LazyRow(
-                                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
                                 contentPadding = PaddingValues(4.dp)
                             ) {
-                                items(favLive, key = { it.id }) { ch ->
+                                itemsIndexed(favLive, key = { _, ch -> ch.id }) { idx, ch ->
                                     TvFocusableSurface(
                                         onClick = { onOpenLiveChannel(ch, favLive) },
-                                        focusScale = 1.05f,
-                                        modifier = Modifier.width(230.dp)
+                                        focusScale = 1.04f,
+                                        containerColor = ObsidianBase,
+                                        focusedContainerColor = HighlightSlate,
+                                        modifier = Modifier
+                                            .width(220.dp)
+                                            .then(if (idx == 0) Modifier.focusRequester(firstFavFocus) else Modifier)
                                     ) {
                                         Row(verticalAlignment = Alignment.CenterVertically) {
                                             ChannelLogoThumbnail(
                                                 title = ch.title,
                                                 logoUrl = ch.posterUrl,
-                                                modifier = Modifier.size(48.dp)
+                                                modifier = Modifier.size(44.dp)
                                             )
                                             Spacer(Modifier.width(12.dp))
                                             Column(modifier = Modifier.weight(1f)) {
                                                 Text(
                                                     text = ch.title,
-                                                    style = MaterialTheme.typography.titleMedium,
+                                                    style = MaterialTheme.typography.titleSmall,
                                                     color = TextPrimary,
                                                     maxLines = 1,
                                                     overflow = TextOverflow.Ellipsis
@@ -307,14 +351,19 @@ fun FavoritesScreen(
                         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text("Favorite Movies & Web Series", style = MaterialTheme.typography.titleLarge, color = BroadcastCyan)
                             LazyRow(
-                                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                                horizontalArrangement = Arrangement.spacedBy(14.dp),
                                 contentPadding = PaddingValues(6.dp)
                             ) {
-                                items(favVodAndSeries, key = { it.id }) { item ->
+                                itemsIndexed(favVodAndSeries, key = { _, it -> it.id }) { idx, item ->
                                     TvPosterCard(
                                         item = item,
                                         onClick = { onOpenVodOrSeries(item) },
-                                        modifier = Modifier.width(164.dp),
+                                        modifier = Modifier
+                                            .width(156.dp)
+                                            .then(
+                                                if (favLive.isEmpty() && idx == 0) Modifier.focusRequester(firstFavFocus)
+                                                else Modifier
+                                            ),
                                         testTag = "fav_poster_${item.id}"
                                     )
                                 }
@@ -328,7 +377,7 @@ fun FavoritesScreen(
 }
 
 /**
- * Full 16:9 TV Details Screen for Movies and Web Series (including Season tabs & Episode list + Resume Playback).
+ * Full 16:9 TV Details Screen for Movies and Web Series (Season tabs + Episode list + Resume).
  */
 @Composable
 fun MediaDetailScreen(
@@ -342,8 +391,15 @@ fun MediaDetailScreen(
     BackHandler { onBack() }
 
     var selectedSeasonIndex by remember(item.id, seriesSeasons.size) { mutableIntStateOf(0) }
+    val primaryActionFocus = remember { FocusRequester() }
+
     LaunchedEffect(seriesSeasons.size) {
         if (selectedSeasonIndex >= seriesSeasons.size) selectedSeasonIndex = 0
+    }
+
+    LaunchedEffect(item.id, isLoadingSeasons) {
+        delay(80L)
+        runCatching { primaryActionFocus.requestFocus() }
     }
 
     Box(
@@ -351,7 +407,6 @@ fun MediaDetailScreen(
             .fillMaxSize()
             .background(ObsidianVoid)
     ) {
-        // Backdrop Artwork
         if (item.backdropUrl.isNotBlank() || item.posterUrl.isNotBlank()) {
             AsyncImage(
                 model = item.backdropUrl.ifBlank { item.posterUrl },
@@ -368,7 +423,6 @@ fun MediaDetailScreen(
             )
         }
 
-        // High-Contrast Cinematic Gradient Scrim
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -376,8 +430,8 @@ fun MediaDetailScreen(
                     Brush.horizontalGradient(
                         listOf(
                             ObsidianVoid.copy(alpha = 0.96f),
-                            ObsidianVoid.copy(alpha = 0.86f),
-                            ObsidianVoid.copy(alpha = 0.70f)
+                            ObsidianVoid.copy(alpha = 0.88f),
+                            ObsidianVoid.copy(alpha = 0.72f)
                         )
                     )
                 )
@@ -388,7 +442,6 @@ fun MediaDetailScreen(
                 .fillMaxSize()
                 .padding(horizontal = 32.dp, vertical = 22.dp)
         ) {
-            // Top Bar
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -409,18 +462,17 @@ fun MediaDetailScreen(
                 modifier = Modifier.fillMaxSize(),
                 horizontalArrangement = Arrangement.spacedBy(28.dp)
             ) {
-                // Left Poster (2:3) + Quick Meta
                 Column(
-                    modifier = Modifier.width(210.dp),
+                    modifier = Modifier.width(205.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .aspectRatio(2f / 3f)
-                            .clip(RoundedCornerShape(14.dp))
+                            .clip(RoundedCornerShape(12.dp))
                             .background(ElevatedSlate)
-                            .border(2.dp, DividerSlate, RoundedCornerShape(14.dp)),
+                            .border(1.dp, DividerSlate, RoundedCornerShape(12.dp)),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
@@ -450,7 +502,6 @@ fun MediaDetailScreen(
                     )
                 }
 
-                // Right Column: Title, Plot, Play/Resume OR Web Series Season/Episodes
                 Column(
                     modifier = Modifier
                         .weight(1f)
@@ -469,7 +520,7 @@ fun MediaDetailScreen(
                         if (item.year.isNotBlank()) TvBadge(text = item.year)
                         if (item.rating.isNotBlank()) {
                             TvBadge(
-                                text = "IMDb ${item.rating}",
+                                text = "★ ${item.rating}",
                                 containerColor = SignalAmber.copy(alpha = 0.2f),
                                 contentColor = SignalAmber
                             )
@@ -486,7 +537,7 @@ fun MediaDetailScreen(
                     Spacer(Modifier.height(12.dp))
 
                     Text(
-                        text = item.plot.ifBlank { "Hardware-accelerated Media3 TV playback ready. Press OK on Play to start watching." },
+                        text = item.plot.ifBlank { "Hardware-accelerated Media3 TV playback ready." },
                         style = MaterialTheme.typography.bodyLarge,
                         color = TextSecondary,
                         maxLines = 4,
@@ -506,6 +557,7 @@ fun MediaDetailScreen(
                                 icon = Icons.Default.PlayArrow,
                                 isPrimary = true,
                                 onClick = { onPlayItem(item) },
+                                modifier = Modifier.focusRequester(primaryActionFocus),
                                 testTag = "detail_play_movie_button"
                             )
                             if (item.resumePositionMs > 5_000L) {
@@ -518,7 +570,6 @@ fun MediaDetailScreen(
                             }
                         }
                     } else {
-                        // Web Series: Season Selector + Episode List
                         if (isLoadingSeasons) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
@@ -529,26 +580,19 @@ fun MediaDetailScreen(
                                 Text("Loading seasons and episodes...", style = MaterialTheme.typography.titleMedium, color = TextSecondary)
                             }
                         } else if (seriesSeasons.isEmpty()) {
-                            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                Text(
-                                    text = "Direct episode stream ready.",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = TextMuted
+                            if (item.streamUrlOrCmd.isNotBlank()) {
+                                TvActionButton(
+                                    text = "Play Episode",
+                                    icon = Icons.Default.PlayArrow,
+                                    isPrimary = true,
+                                    onClick = { onPlayItem(item) },
+                                    modifier = Modifier.focusRequester(primaryActionFocus),
+                                    testTag = "detail_play_direct_episode"
                                 )
-                                if (item.streamUrlOrCmd.isNotBlank()) {
-                                    TvActionButton(
-                                        text = "Play Episode",
-                                        icon = Icons.Default.PlayArrow,
-                                        isPrimary = true,
-                                        onClick = { onPlayItem(item) },
-                                        testTag = "detail_play_direct_episode"
-                                    )
-                                }
                             }
                         } else {
-                            // Season Tabs
                             LazyRow(
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 contentPadding = PaddingValues(vertical = 4.dp)
                             ) {
                                 items(seriesSeasons.size) { index ->
@@ -569,15 +613,16 @@ fun MediaDetailScreen(
                                 contentPadding = PaddingValues(4.dp),
                                 modifier = Modifier.weight(1f)
                             ) {
-                                items(activeSeason?.episodes.orEmpty(), key = { it.id }) { ep ->
+                                itemsIndexed(activeSeason?.episodes.orEmpty(), key = { _, ep -> ep.id }) { idx, ep ->
                                     TvFocusableSurface(
                                         onClick = { onPlayItem(ep) },
                                         focusScale = 1.02f,
-                                        containerColor = MidnightPanel.copy(alpha = 0.9f),
-                                        focusedContainerColor = BroadcastCyanDeep,
+                                        containerColor = ObsidianBase.copy(alpha = 0.9f),
+                                        focusedContainerColor = HighlightSlate,
                                         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                                         modifier = Modifier
                                             .fillMaxWidth()
+                                            .then(if (idx == 0) Modifier.focusRequester(primaryActionFocus) else Modifier)
                                             .testTag("episode_${ep.id}")
                                     ) { isFocused ->
                                         Row(
@@ -586,9 +631,9 @@ fun MediaDetailScreen(
                                         ) {
                                             Box(
                                                 modifier = Modifier
-                                                    .clip(RoundedCornerShape(8.dp))
-                                                    .background(if (isFocused) Color.White.copy(alpha = 0.2f) else ElevatedSlate)
-                                                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                                                    .clip(RoundedCornerShape(6.dp))
+                                                    .background(if (isFocused) BroadcastCyanDeep else ElevatedSlate)
+                                                    .padding(horizontal = 10.dp, vertical = 5.dp)
                                             ) {
                                                 Text(
                                                     text = "E${ep.episodeNumber.toString().padStart(2, '0')}",
@@ -618,7 +663,7 @@ fun MediaDetailScreen(
                                                 imageVector = Icons.Default.PlayArrow,
                                                 contentDescription = "Play ${ep.title}",
                                                 tint = if (isFocused) Color.White else BroadcastCyan,
-                                                modifier = Modifier.size(24.dp)
+                                                modifier = Modifier.size(22.dp)
                                             )
                                         }
                                     }
@@ -637,31 +682,36 @@ private fun TvPosterCard(
     item: MediaItem,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    onFocused: (() -> Unit)? = null,
     testTag: String = ""
 ) {
     TvFocusableSurface(
         onClick = onClick,
+        onFocused = onFocused,
         focusScale = 1.06f,
-        shape = RoundedCornerShape(12.dp),
-        containerColor = MidnightPanel,
+        shape = RoundedCornerShape(10.dp),
+        containerColor = ObsidianBase,
         focusedContainerColor = HighlightSlate,
+        borderColor = Color.Transparent,
+        focusedBorderColor = BroadcastCyan,
+        focusedBorderWidth = 2.dp,
         contentPadding = PaddingValues(0.dp),
         modifier = modifier.then(if (testTag.isNotBlank()) Modifier.testTag(testTag) else Modifier)
     ) { isFocused ->
         Column(modifier = Modifier.fillMaxWidth()) {
-            // Strict 2:3 Poster Frame
+            // Strict 2:3 Poster Frame tuned for 5-column TV grid readability
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .aspectRatio(2f / 3f)
-                    .background(ElevatedSlate)
+                    .background(MidnightPanel)
             ) {
                 Icon(
                     imageVector = if (item.type == ContentType.VOD) Icons.Default.Movie else Icons.Default.Tv,
                     contentDescription = item.title,
-                    tint = TextMuted.copy(alpha = 0.4f),
+                    tint = TextMuted.copy(alpha = 0.35f),
                     modifier = Modifier
-                        .size(44.dp)
+                        .size(38.dp)
                         .align(Alignment.Center)
                 )
                 if (item.posterUrl.isNotBlank()) {
@@ -673,20 +723,29 @@ private fun TvPosterCard(
                     )
                 }
 
-                // Rating / Year Top Badges
+                // Compact high-contrast rating & favorite overlay
                 Row(
                     modifier = Modifier
                         .align(Alignment.TopStart)
                         .fillMaxWidth()
-                        .padding(8.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween
+                        .padding(6.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
                     if (item.rating.isNotBlank()) {
-                        TvBadge(
-                            text = "★ ${item.rating}",
-                            containerColor = ObsidianVoid.copy(alpha = 0.85f),
-                            contentColor = SignalAmber
-                        )
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(5.dp))
+                                .background(ObsidianVoid.copy(alpha = 0.86f))
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = "★ ${item.rating.take(4)}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SignalAmber,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     } else {
                         Spacer(Modifier.width(1.dp))
                     }
@@ -695,12 +754,11 @@ private fun TvPosterCard(
                             imageVector = Icons.Default.Star,
                             contentDescription = "Favorite",
                             tint = SignalAmber,
-                            modifier = Modifier.size(18.dp)
+                            modifier = Modifier.size(16.dp)
                         )
                     }
                 }
 
-                // Resume Progress Bar at Bottom of Poster
                 if (item.resumePositionMs > 5_000L && item.durationMs > 0L) {
                     val progress = (item.resumePositionMs.toFloat() / item.durationMs.toFloat()).coerceIn(0.05f, 1f)
                     LinearProgressIndicator(
@@ -710,15 +768,15 @@ private fun TvPosterCard(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
                             .fillMaxWidth()
-                            .height(4.dp)
+                            .height(3.dp)
                     )
                 }
             }
 
-            Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+            Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 7.dp)) {
                 Text(
                     text = item.title,
-                    style = MaterialTheme.typography.titleSmall,
+                    style = MaterialTheme.typography.labelLarge,
                     color = if (isFocused) TextPrimary else TextSecondary,
                     fontWeight = if (isFocused) FontWeight.Bold else FontWeight.Medium,
                     maxLines = 1,
@@ -726,7 +784,7 @@ private fun TvPosterCard(
                 )
                 val metaLine = buildList {
                     if (item.year.isNotBlank()) add(item.year)
-                    if (item.resumePositionMs > 5_000L) add("Resume ${formatDurationMs(item.resumePositionMs)}")
+                    if (item.resumePositionMs > 5_000L) add(formatDurationMs(item.resumePositionMs))
                 }.joinToString(" • ").ifBlank { item.type.label }
                 Text(
                     text = metaLine,
@@ -744,17 +802,20 @@ private fun TvPosterCard(
 private fun CategoryFilterPill(
     label: String,
     selected: Boolean,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
     TvFocusableSurface(
         onClick = onClick,
         selected = selected,
         focusScale = 1.04f,
-        shape = RoundedCornerShape(20.dp),
-        containerColor = MidnightPanel,
-        selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.55f),
+        shape = RoundedCornerShape(18.dp),
+        containerColor = ObsidianBase,
+        selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.50f),
         focusedContainerColor = BroadcastCyan,
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 9.dp)
+        borderColor = DividerSlate.copy(alpha = 0.45f),
+        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+        modifier = modifier
     ) { isFocused ->
         Text(
             text = label,
@@ -774,6 +835,12 @@ private fun MediaCatalogEmptyState(
     onGoToPlaylists: () -> Unit,
     onReopenFilter: () -> Unit
 ) {
+    val addFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        delay(80L)
+        runCatching { addFocus.requestFocus() }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -783,9 +850,8 @@ private fun MediaCatalogEmptyState(
         Column(
             modifier = Modifier
                 .width(560.dp)
-                .clip(RoundedCornerShape(16.dp))
+                .clip(RoundedCornerShape(14.dp))
                 .background(ObsidianBase)
-                .border(1.dp, DividerSlate, RoundedCornerShape(16.dp))
                 .padding(32.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -799,7 +865,8 @@ private fun MediaCatalogEmptyState(
                     text = "Add Playlist",
                     icon = Icons.Default.AddCircle,
                     isPrimary = true,
-                    onClick = onGoToPlaylists
+                    onClick = onGoToPlaylists,
+                    modifier = Modifier.focusRequester(addFocus)
                 )
                 TvActionButton(
                     text = "Edit Category Filter",
