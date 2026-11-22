@@ -1,0 +1,8 @@
+{
+  "name": "TiviWave TV",
+  "description": "Android TV-first IPTV player inspired by TiviMate with Stalker Portal (MAG/STB), Xtream Codes, M3U/M3U8, GitHub Gist JSON, Country/Proxy VPN routing, 2-Step Country & Category Pre-Load Filter, EPG guide, and Media3 ExoPlayer.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

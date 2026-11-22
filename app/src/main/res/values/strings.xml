@@ -1,0 +1,23 @@
+<resources>
+    <string name="app_name">TiviWave TV</string>
+    <string name="nav_live_tv">Live TV</string>
+    <string name="nav_movies">Movies</string>
+    <string name="nav_web_series">Web Series</string>
+    <string name="nav_favorites">Favorites</string>
+    <string name="nav_routing">Country / Proxy</string>
+    <string name="nav_playlists">Playlists &amp; Filter</string>
+    <string name="vpn_notification_channel_name">Proxy Routing Tunnel</string>
+    <string name="vpn_notification_title">TiviWave Routing Active</string>
+    <string name="vpn_notification_text">Routing IPTV traffic through configured proxy node</string>
+    <string name="action_add_playlist">Add Playlist</string>
+    <string name="action_edit_filter">Category Filter</string>
+    <string name="action_import_selected">Import Selected</string>
+    <string name="action_select_all">Select All</string>
+    <string name="action_clear_all">Clear</string>
+    <string name="action_connect">Connect</string>
+    <string name="action_disconnect">Disconnect</string>
+    <string name="action_play">Play</string>
+    <string name="action_resume">Resume</string>
+    <string name="action_favorite">Favorite</string>
+    <string name="action_fullscreen_hint">Press OK for Full Screen</string>
+</resources>
