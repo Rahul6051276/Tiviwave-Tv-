@@ -37,6 +37,8 @@ class XtreamAndM3uService(private val context: Context) {
 
     /**
      * Step 2 Selective Import: Loads ONLY items belonging to checked categories.
+     * Sorts VOD and Web Series by `added` / `last_modified` timestamp (or numeric ID descending)
+     * so newly uploaded IPTV releases always appear at the top.
      */
     suspend fun fetchItemsForCategories(
         source: PlaylistSource,
@@ -45,7 +47,7 @@ class XtreamAndM3uService(private val context: Context) {
         if (selectedCategories.isEmpty()) return emptyList()
         return when (source.type) {
             SourceType.XTREAM -> fetchXtreamItemsForCategories(source, selectedCategories)
-            SourceType.M3U_URL -> filterBufferedOrReloadM3u(source, selectedCategories)
+            SourceType.M3U_URL,
             SourceType.M3U_FILE -> filterBufferedOrReloadM3u(source, selectedCategories)
             SourceType.GIST_JSON -> filterBufferedOrReloadGist(source, selectedCategories)
             SourceType.STALKER -> emptyList()
@@ -64,6 +66,35 @@ class XtreamAndM3uService(private val context: Context) {
             clean = "http://$clean"
         }
         return clean.removeSuffix("/player_api.php")
+    }
+
+    private fun extractOrigin(baseUrl: String): String {
+        val parsed = baseUrl.toHttpUrlOrNull() ?: return baseUrl
+        val defaultPort = (parsed.scheme == "http" && parsed.port == 80) ||
+            (parsed.scheme == "https" && parsed.port == 443)
+        return if (defaultPort) {
+            "${parsed.scheme}://${parsed.host}"
+        } else {
+            "${parsed.scheme}://${parsed.host}:${parsed.port}"
+        }
+    }
+
+    private fun resolveXtreamAssetUrl(baseUrl: String, assetPath: String): String {
+        val clean = assetPath.trim()
+        if (clean.isBlank() || clean.equals("null", ignoreCase = true) || clean.equals("false", ignoreCase = true)) {
+            return ""
+        }
+        if (clean.startsWith("http://", ignoreCase = true) || clean.startsWith("https://", ignoreCase = true)) {
+            return clean
+        }
+        if (clean.startsWith("//")) {
+            val scheme = if (baseUrl.startsWith("https://", ignoreCase = true)) "https:" else "http:"
+            return "$scheme$clean"
+        }
+        if (clean.startsWith("/")) {
+            return "${extractOrigin(baseUrl)}$clean"
+        }
+        return "${baseUrl.trimEnd('/')}/$clean"
     }
 
     fun buildXtreamXmltvUrl(source: PlaylistSource): String {
@@ -109,8 +140,8 @@ class XtreamAndM3uService(private val context: Context) {
                 val array = JSONArray(raw)
                 for (i in 0 until array.length()) {
                     val obj = array.optJSONObject(i) ?: continue
-                    val catId = obj.optString("category_id").trim()
-                    val catName = obj.optString("category_name").trim()
+                    val catId = obj.optCleanString("category_id")
+                    val catName = obj.optCleanString("category_name")
                     if (catId.isBlank() || catName.isBlank()) continue
                     categories += ContentCategory(
                         id = "${contentType.name.lowercase()}_$catId",
@@ -151,67 +182,105 @@ class XtreamAndM3uService(private val context: Context) {
                     val obj = array.optJSONObject(i) ?: continue
                     when (category.type) {
                         ContentType.LIVE -> {
-                            val streamId = obj.optString("stream_id").trim()
-                            val name = obj.optString("name").trim()
+                            val streamId = obj.optCleanString("stream_id")
+                            val name = obj.optCleanString("name")
                             if (streamId.isBlank() || name.isBlank()) continue
+                            val iconUrl = resolveXtreamAssetUrl(base, obj.optCleanString("stream_icon"))
                             items += MediaItem(
                                 id = "${source.id}_live_$streamId",
                                 sourceId = source.id,
                                 title = name,
                                 streamUrlOrCmd = "$base/live/$user/$pass/$streamId.ts",
-                                posterUrl = obj.optString("stream_icon").trim(),
+                                posterUrl = iconUrl,
                                 categoryId = category.id,
                                 type = ContentType.LIVE,
-                                epgChannelId = obj.optString("epg_channel_id").ifBlank { streamId }.trim(),
+                                epgChannelId = obj.optCleanString("epg_channel_id").ifBlank { streamId },
                                 channelNumber = obj.optInt("num", i + 1)
                             )
                         }
 
                         ContentType.VOD -> {
-                            val streamId = obj.optString("stream_id").trim()
-                            val name = obj.optString("name").trim()
-                            val ext = obj.optString("container_extension").ifBlank { "mp4" }.trim()
+                            val streamId = obj.optCleanString("stream_id")
+                            val name = obj.optCleanString("name")
+                            val ext = obj.optCleanString("container_extension").ifBlank { "mp4" }
                             if (streamId.isBlank() || name.isBlank()) continue
+                            val poster = resolveXtreamAssetUrl(
+                                base,
+                                obj.optCleanString("stream_icon").ifBlank { obj.optCleanString("cover") }
+                            )
+                            val addedAt = parseXtreamAddedMs(
+                                obj.optCleanString("added"),
+                                fallbackId = streamId.toLongOrNull() ?: i.toLong()
+                            )
+                            val rating = normalizeRating(
+                                obj.optCleanString("rating").ifBlank { obj.optCleanString("rating_5based") }
+                            )
                             items += MediaItem(
                                 id = "${source.id}_vod_$streamId",
                                 sourceId = source.id,
                                 title = name,
                                 streamUrlOrCmd = "$base/movie/$user/$pass/$streamId.$ext",
-                                posterUrl = obj.optString("stream_icon").trim(),
-                                backdropUrl = obj.optString("stream_icon").trim(),
+                                posterUrl = poster,
+                                backdropUrl = poster,
                                 categoryId = category.id,
                                 type = ContentType.VOD,
-                                rating = obj.optString("rating").trim(),
-                                year = obj.optString("year").trim(),
-                                plot = obj.optString("plot").trim()
+                                rating = rating,
+                                year = obj.optCleanString("year").ifBlank { extractYearFromTitle(name) },
+                                plot = obj.optCleanString("plot"),
+                                addedAt = addedAt
                             )
                         }
 
                         ContentType.SERIES -> {
-                            val seriesId = obj.optString("series_id").trim()
-                            val name = obj.optString("name").trim()
+                            val seriesId = obj.optCleanString("series_id")
+                            val name = obj.optCleanString("name")
                             if (seriesId.isBlank() || name.isBlank()) continue
-                            val backdrop = obj.optJSONArray("backdrop_path")?.optString(0).orEmpty()
+                            val rawBackdrop = obj.optJSONArray("backdrop_path")?.optString(0).orEmpty()
+                            val rawCover = obj.optCleanString("cover")
+                                .ifBlank { obj.optCleanString("stream_icon") }
+                                .ifBlank { obj.optCleanString("poster") }
+                                .ifBlank { rawBackdrop }
+                            val poster = resolveXtreamAssetUrl(base, rawCover)
+                            val backdrop = resolveXtreamAssetUrl(base, rawBackdrop.ifBlank { rawCover })
+                            val addedAt = parseXtreamAddedMs(
+                                obj.optCleanString("last_modified").ifBlank { obj.optCleanString("added") },
+                                fallbackId = seriesId.toLongOrNull() ?: i.toLong()
+                            )
+                            val rating = normalizeRating(
+                                obj.optCleanString("rating").ifBlank { obj.optCleanString("rating_5based") }
+                            )
                             items += MediaItem(
                                 id = "${source.id}_series_$seriesId",
                                 sourceId = source.id,
                                 title = name,
                                 streamUrlOrCmd = "",
-                                posterUrl = obj.optString("cover").trim(),
-                                backdropUrl = backdrop.ifBlank { obj.optString("cover").trim() },
+                                posterUrl = poster,
+                                backdropUrl = backdrop,
                                 categoryId = category.id,
                                 type = ContentType.SERIES,
-                                rating = obj.optString("rating").trim(),
-                                plot = obj.optString("plot").trim(),
-                                year = obj.optString("releaseDate").take(4).trim(),
-                                seriesId = seriesId
+                                rating = rating,
+                                plot = obj.optCleanString("plot"),
+                                year = obj.optCleanString("releaseDate").take(4)
+                                    .ifBlank { obj.optCleanString("year") }
+                                    .ifBlank { extractYearFromTitle(name) },
+                                seriesId = seriesId,
+                                addedAt = addedAt
                             )
                         }
                     }
                 }
             }
         }
-        items.distinctBy { "${it.type.name}:${it.id}" }
+
+        val deduped = items.distinctBy { "${it.type.name}:${it.id}" }
+        val liveItems = deduped.filter { it.type == ContentType.LIVE }
+            .sortedWith(compareBy<MediaItem> { if (it.channelNumber > 0) it.channelNumber else Int.MAX_VALUE }.thenBy { it.title })
+        val vodAndSeries = deduped.filter { it.type != ContentType.LIVE }
+            .sortedWith(
+                compareByDescending<MediaItem> { it.addedAt }
+                    .thenByDescending { it.id.substringAfterLast('_').filter(Char::isDigit).toLongOrNull() ?: 0L }
+            )
+        liveItems + vodAndSeries
     }
 
     suspend fun fetchXtreamSeriesSeasons(
@@ -237,14 +306,15 @@ class XtreamAndM3uService(private val context: Context) {
 
             for (i in 0 until epArray.length()) {
                 val epObj = epArray.optJSONObject(i) ?: continue
-                val epId = epObj.optString("id").trim()
+                val epId = epObj.optCleanString("id")
                 if (epId.isBlank()) continue
-                val ext = epObj.optString("container_extension").ifBlank { "mp4" }.trim()
+                val ext = epObj.optCleanString("container_extension").ifBlank { "mp4" }
                 val epNum = epObj.optInt("episode_num", i + 1)
                 val info = epObj.optJSONObject("info")
-                val title = epObj.optString("title").ifBlank { "Episode $epNum" }.trim()
-                val plot = info?.optString("plot").orEmpty().ifBlank { seriesItem.plot }
-                val poster = info?.optString("movie_image").orEmpty().ifBlank { seriesItem.posterUrl }
+                val title = epObj.optCleanString("title").ifBlank { "Episode $epNum" }
+                val plot = info?.optCleanString("plot").orEmpty().ifBlank { seriesItem.plot }
+                val rawPoster = info?.optCleanString("movie_image").orEmpty()
+                val poster = resolveXtreamAssetUrl(base, rawPoster).ifBlank { seriesItem.posterUrl }
 
                 episodes += MediaItem(
                     id = "${source.id}_xep_${seriesId}_${seasonNum}_$epId",
@@ -255,12 +325,13 @@ class XtreamAndM3uService(private val context: Context) {
                     backdropUrl = seriesItem.backdropUrl,
                     categoryId = seriesItem.categoryId,
                     type = ContentType.SERIES,
-                    rating = info?.optString("rating").orEmpty().ifBlank { seriesItem.rating },
+                    rating = normalizeRating(info?.optCleanString("rating").orEmpty()).ifBlank { seriesItem.rating },
                     plot = plot,
                     year = seriesItem.year,
                     seriesId = seriesId,
                     seasonNumber = seasonNum,
-                    episodeNumber = epNum
+                    episodeNumber = epNum,
+                    addedAt = seriesItem.addedAt
                 )
             }
 
@@ -309,7 +380,11 @@ class XtreamAndM3uService(private val context: Context) {
             parsedItemBuffer[source.id].orEmpty()
         }
         val selectedIds = selectedCategories.map { it.id }.toSet()
-        return cached.filter { it.categoryId in selectedIds }
+        val filtered = cached.filter { it.categoryId in selectedIds }
+        val live = filtered.filter { it.type == ContentType.LIVE }
+        val vodAndSeries = filtered.filter { it.type != ContentType.LIVE }
+            .sortedByDescending { it.addedAt }
+        return live + vodAndSeries
     }
 
     fun parseM3uContent(sourceId: String, content: String): Pair<List<ContentCategory>, List<MediaItem>> {
@@ -321,6 +396,7 @@ class XtreamAndM3uService(private val context: Context) {
         var pendingExtInf: String? = null
         val pendingHeaders = mutableMapOf<String, String>()
         var channelCounter = 1
+        var sequenceOrder = 1L
 
         val attrRegex = Regex("([a-zA-Z0-9_-]+)\\s*=\\s*\"([^\"]*)\"")
 
@@ -392,11 +468,13 @@ class XtreamAndM3uService(private val context: Context) {
                         backdropUrl = tvgLogo,
                         categoryId = catKey,
                         type = contentType,
+                        year = extractYearFromTitle(displayName),
                         epgChannelId = tvgId.ifBlank { tvgName },
                         seriesId = seriesBaseName,
                         seasonNumber = seasonNum,
                         episodeNumber = episodeNum,
                         channelNumber = if (contentType == ContentType.LIVE) (tvgChNo ?: channelCounter++) else 0,
+                        addedAt = sequenceOrder++,
                         streamHeaders = pendingHeaders.toMap()
                     )
 
@@ -420,7 +498,6 @@ class XtreamAndM3uService(private val context: Context) {
         val rawUrl = resolveGistRawUrl(source.m3uUrl)
         val body = downloadText(rawUrl).trim()
 
-        // If Gist points to an M3U playlist text directly, seamlessly parse as M3U
         if (body.startsWith("#EXTM3U", ignoreCase = true) || body.contains("#EXTINF:")) {
             val (cats, items) = parseM3uContent(source.id, body)
             parsedItemBuffer[source.id] = items
@@ -441,7 +518,11 @@ class XtreamAndM3uService(private val context: Context) {
             parsedItemBuffer[source.id].orEmpty()
         }
         val selectedIds = selectedCategories.map { it.id }.toSet()
-        return cached.filter { it.categoryId in selectedIds }
+        val filtered = cached.filter { it.categoryId in selectedIds }
+        val live = filtered.filter { it.type == ContentType.LIVE }
+        val vodAndSeries = filtered.filter { it.type != ContentType.LIVE }
+            .sortedByDescending { it.addedAt }
+        return live + vodAndSeries
     }
 
     private fun resolveGistRawUrl(url: String): String {
@@ -488,23 +569,20 @@ class XtreamAndM3uService(private val context: Context) {
         var chNumber = 1
 
         for ((index, obj) in entries.withIndex()) {
-            val title = obj.optString("title")
-                .ifBlank { obj.optString("name") }
-                .ifBlank { obj.optString("channel") }
-                .trim()
-            val url = obj.optString("url")
-                .ifBlank { obj.optString("stream_url") }
-                .ifBlank { obj.optString("streamUrl") }
-                .ifBlank { obj.optString("link") }
-                .trim()
+            val title = obj.optCleanString("title")
+                .ifBlank { obj.optCleanString("name") }
+                .ifBlank { obj.optCleanString("channel") }
+            val url = obj.optCleanString("url")
+                .ifBlank { obj.optCleanString("stream_url") }
+                .ifBlank { obj.optCleanString("streamUrl") }
+                .ifBlank { obj.optCleanString("link") }
             if (title.isBlank() || url.isBlank()) continue
 
-            val group = obj.optString("group")
-                .ifBlank { obj.optString("category") }
-                .ifBlank { obj.optString("group_title") }
+            val group = obj.optCleanString("group")
+                .ifBlank { obj.optCleanString("category") }
+                .ifBlank { obj.optCleanString("group_title") }
                 .ifBlank { "Gist Channels" }
-                .trim()
-            val explicitType = obj.optString("type").uppercase()
+            val explicitType = obj.optCleanString("type").uppercase()
             val contentType = when {
                 explicitType.contains("VOD") || explicitType.contains("MOVIE") -> ContentType.VOD
                 explicitType.contains("SERIES") -> ContentType.SERIES
@@ -534,28 +612,33 @@ class XtreamAndM3uService(private val context: Context) {
                 }
             }
 
+            val addedAt = parseXtreamAddedMs(
+                obj.optCleanString("added").ifBlank { obj.optCleanString("addedAt") },
+                fallbackId = (index + 1).toLong()
+            )
+
             items += MediaItem(
                 id = "${sourceId}_gist_${index}_${url.hashCode()}",
                 sourceId = sourceId,
                 title = title,
                 streamUrlOrCmd = url,
-                posterUrl = obj.optString("logo")
-                    .ifBlank { obj.optString("poster") }
-                    .ifBlank { obj.optString("posterUrl") }
-                    .trim(),
-                backdropUrl = obj.optString("backdrop")
-                    .ifBlank { obj.optString("backdropUrl") }
-                    .trim(),
+                posterUrl = obj.optCleanString("poster")
+                    .ifBlank { obj.optCleanString("posterUrl") }
+                    .ifBlank { obj.optCleanString("cover") }
+                    .ifBlank { obj.optCleanString("logo") },
+                backdropUrl = obj.optCleanString("backdrop")
+                    .ifBlank { obj.optCleanString("backdropUrl") },
                 categoryId = catId,
                 type = contentType,
-                rating = obj.optString("rating").trim(),
-                plot = obj.optString("plot").ifBlank { obj.optString("description") }.trim(),
-                year = obj.optString("year").trim(),
-                epgChannelId = obj.optString("epg_id").ifBlank { obj.optString("tvg_id") }.trim(),
-                seriesId = obj.optString("series_id").trim(),
+                rating = normalizeRating(obj.optCleanString("rating")),
+                plot = obj.optCleanString("plot").ifBlank { obj.optCleanString("description") },
+                year = obj.optCleanString("year").ifBlank { extractYearFromTitle(title) },
+                epgChannelId = obj.optCleanString("epg_id").ifBlank { obj.optCleanString("tvg_id") },
+                seriesId = obj.optCleanString("series_id"),
                 seasonNumber = obj.optInt("season", 0),
                 episodeNumber = obj.optInt("episode", 0),
                 channelNumber = if (contentType == ContentType.LIVE) chNumber++ else 0,
+                addedAt = addedAt,
                 streamHeaders = headers
             )
         }
@@ -564,6 +647,38 @@ class XtreamAndM3uService(private val context: Context) {
             cat.copy(itemCount = categoryCounts[cat.id] ?: 0)
         }
         return finalizedCategories to items
+    }
+
+    private fun parseXtreamAddedMs(raw: String, fallbackId: Long): Long {
+        val cleaned = raw.trim()
+        val numeric = cleaned.toLongOrNull()
+        if (numeric != null && numeric > 0L) {
+            return if (numeric > 10_000_000_000L) numeric else numeric * 1000L
+        }
+        return fallbackId
+    }
+
+    private fun normalizeRating(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isBlank()) return ""
+        val parsed = trimmed.toFloatOrNull() ?: return ""
+        return if (parsed > 0f) trimmed else ""
+    }
+
+    private fun extractYearFromTitle(title: String): String {
+        return Regex("\\b(19\\d{2}|20\\d{2})\\b").find(title)?.groupValues?.getOrNull(1).orEmpty()
+    }
+
+    private fun JSONObject.optCleanString(key: String): String {
+        if (!has(key) || isNull(key)) return ""
+        val raw = opt(key) ?: return ""
+        if (raw is Boolean) return ""
+        val str = raw.toString().trim()
+        return if (str.equals("null", ignoreCase = true) || str.equals("false", ignoreCase = true)) {
+            ""
+        } else {
+            str
+        }
     }
 
     private fun downloadText(rawUrl: String): String {

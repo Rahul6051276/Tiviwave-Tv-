@@ -37,6 +37,13 @@ enum class TvSection(val label: String) {
     PLAYLISTS("Playlists & Filter")
 }
 
+enum class CatalogSortMode(val label: String) {
+    LATEST_ADDED("Latest Added"),
+    RELEASE_YEAR("Release Year (Newest)"),
+    RATING("Rating"),
+    TITLE_AZ("A–Z")
+}
+
 data class PlaylistSource(
     val id: String = UUID.randomUUID().toString(),
     val name: String,
@@ -86,6 +93,7 @@ data class MediaItem(
     val isFavorite: Boolean = false,
     val resumePositionMs: Long = 0L,
     val durationMs: Long = 0L,
+    val addedAt: Long = 0L,
     val streamHeaders: Map<String, String> = emptyMap()
 )
 

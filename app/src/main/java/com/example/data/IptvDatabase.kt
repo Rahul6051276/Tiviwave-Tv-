@@ -10,6 +10,8 @@ import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import com.example.models.ContentCategory
 import com.example.models.ContentType
 import com.example.models.MediaItem
@@ -72,6 +74,7 @@ data class MediaItemEntity(
     val isFavorite: Boolean,
     val resumePositionMs: Long,
     val durationMs: Long,
+    val addedAt: Long = 0L,
     val streamHeadersJson: String
 )
 
@@ -118,7 +121,7 @@ interface IptvDao {
     @Query("DELETE FROM content_categories WHERE sourceId = :sourceId")
     suspend fun deleteCategoriesForSource(sourceId: String)
 
-    @Query("SELECT * FROM media_items ORDER BY channelNumber ASC, title ASC")
+    @Query("SELECT * FROM media_items ORDER BY CASE WHEN type = 'LIVE' THEN 0 ELSE 1 END, channelNumber ASC, addedAt DESC, title ASC")
     fun observeAllMediaItems(): Flow<List<MediaItemEntity>>
 
     @Query("SELECT * FROM media_items WHERE sourceId = :sourceId")
@@ -153,7 +156,7 @@ interface IptvDao {
         MediaItemEntity::class,
         RoutingNodeEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class IptvDatabase : RoomDatabase() {
@@ -163,13 +166,20 @@ abstract class IptvDatabase : RoomDatabase() {
         @Volatile
         private var instance: IptvDatabase? = null
 
+        private val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE media_items ADD COLUMN addedAt INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
         fun getInstance(context: Context): IptvDatabase {
             return instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
                     context.applicationContext,
                     IptvDatabase::class.java,
                     "tiviwave_iptv.db"
-                ).fallbackToDestructiveMigration(dropAllTables = true)
+                ).addMigrations(MIGRATION_1_2)
+                    .fallbackToDestructiveMigration(dropAllTables = true)
                     .build()
                     .also { instance = it }
             }
@@ -258,6 +268,7 @@ fun MediaItem.toEntity(): MediaItemEntity {
         isFavorite = isFavorite,
         resumePositionMs = resumePositionMs,
         durationMs = durationMs,
+        addedAt = addedAt,
         streamHeadersJson = json.toString()
     )
 }
@@ -292,6 +303,7 @@ fun MediaItemEntity.toModel(): MediaItem {
         isFavorite = isFavorite,
         resumePositionMs = resumePositionMs,
         durationMs = durationMs,
+        addedAt = addedAt,
         streamHeaders = headers
     )
 }

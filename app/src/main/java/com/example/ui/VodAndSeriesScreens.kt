@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -29,6 +30,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.AddCircle
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.Movie
@@ -45,7 +47,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -57,13 +61,17 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.example.R
+import com.example.models.CatalogSortMode
 import com.example.models.ContentCategory
 import com.example.models.ContentType
 import com.example.models.MediaItem
@@ -87,9 +95,10 @@ import java.util.Locale
 
 /**
  * TV 5-Column 2:3 Poster Grid for Movies (VOD) and Web Series:
- * - Strictly 5 columns per row (GridCells.Fixed(5)) on Android TV landscape screens.
- * - Readable rating badges & concise titles at 5-column density.
- * - Predictable FocusRequester entry point, auto-scroll on focus, and crisp D-Pad zoom.
+ * - Default sort: Latest Added (newest server additions at the very top).
+ * - Interactive TV D-Pad Sort chip cycling: Latest Added -> Release Year (Newest) -> Rating -> A–Z.
+ * - Per-item unique Coil cache keys & headers to eliminate repeated poster bitmaps in Web Series.
+ * - Hides ★ 0 / invalid ratings and provides generous bottom title padding so titles never clip.
  */
 @Composable
 fun VodOrSeriesGridScreen(
@@ -102,18 +111,39 @@ fun VodOrSeriesGridScreen(
     onGoToPlaylists: () -> Unit,
     onReopenFilter: () -> Unit
 ) {
+    var sortMode by remember(contentType) { mutableStateOf(CatalogSortMode.LATEST_ADDED) }
+
     val typeCategories = remember(categories, contentType) {
         categories.filter { it.type == contentType }
     }
     val typeItems = remember(items, contentType) {
         items.filter { it.type == contentType }
     }
-    val filteredItems = remember(typeItems, selectedCategoryId) {
-        when (selectedCategoryId) {
+    val sortedFilteredItems = remember(typeItems, selectedCategoryId, sortMode) {
+        val filtered = when (selectedCategoryId) {
             "ALL" -> typeItems
             "FAVORITES" -> typeItems.filter { it.isFavorite }
             "CONTINUE" -> typeItems.filter { it.resumePositionMs > 5_000L }
             else -> typeItems.filter { it.categoryId == selectedCategoryId }
+        }
+        when (sortMode) {
+            CatalogSortMode.LATEST_ADDED -> filtered.sortedWith(
+                compareByDescending<MediaItem> { it.addedAt }
+                    .thenByDescending { extractNumericTailId(it.id) }
+            )
+
+            CatalogSortMode.RELEASE_YEAR -> filtered.sortedWith(
+                compareByDescending<MediaItem> { extractReleaseYearInt(it.year, it.title) }
+                    .thenByDescending { it.addedAt }
+                    .thenByDescending { extractNumericTailId(it.id) }
+            )
+
+            CatalogSortMode.RATING -> filtered.sortedWith(
+                compareByDescending<MediaItem> { parseRatingFloat(it.rating) }
+                    .thenByDescending { it.addedAt }
+            )
+
+            CatalogSortMode.TITLE_AZ -> filtered.sortedBy { it.title.lowercase(Locale.US) }
         }
     }
 
@@ -133,12 +163,19 @@ fun VodOrSeriesGridScreen(
     val firstPillFocus = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
 
-    LaunchedEffect(contentType, selectedCategoryId, filteredItems.isNotEmpty()) {
+    LaunchedEffect(contentType, selectedCategoryId, sortedFilteredItems.isNotEmpty()) {
         delay(70L)
-        if (filteredItems.isNotEmpty()) {
+        if (sortedFilteredItems.isNotEmpty()) {
             runCatching { firstPosterFocus.requestFocus() }
         } else {
             runCatching { firstPillFocus.requestFocus() }
+        }
+    }
+
+    // Scroll back to top whenever sort order changes so newly sorted releases are visible immediately
+    LaunchedEffect(sortMode) {
+        if (sortedFilteredItems.isNotEmpty()) {
+            gridState.scrollToItem(0)
         }
     }
 
@@ -163,7 +200,12 @@ fun VodOrSeriesGridScreen(
                     style = MaterialTheme.typography.headlineMedium,
                     color = TextPrimary
                 )
-                TvBadge(text = "${filteredItems.size} titles")
+                TvBadge(text = "${sortedFilteredItems.size} titles")
+                TvBadge(
+                    text = sortMode.label,
+                    containerColor = BroadcastCyanDeep.copy(alpha = 0.25f),
+                    contentColor = BroadcastCyan
+                )
             }
             TvActionButton(
                 text = "Edit Categories",
@@ -175,11 +217,46 @@ fun VodOrSeriesGridScreen(
 
         Spacer(Modifier.height(12.dp))
 
-        // Horizontal Category Filter Chips
+        // Horizontal Category Filter Chips + TV D-Pad Sort Chip
         LazyRow(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             contentPadding = PaddingValues(vertical = 4.dp)
         ) {
+            item(key = "pill_sort") {
+                TvFocusableSurface(
+                    onClick = {
+                        val allModes = CatalogSortMode.entries
+                        sortMode = allModes[(allModes.indexOf(sortMode) + 1) % allModes.size]
+                    },
+                    selected = true,
+                    focusScale = 1.04f,
+                    shape = RoundedCornerShape(18.dp),
+                    containerColor = ElevatedSlate,
+                    selectedContainerColor = ElevatedSlate,
+                    focusedContainerColor = BroadcastCyan,
+                    borderColor = BroadcastCyan.copy(alpha = 0.55f),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                    modifier = Modifier.testTag("${contentType.name.lowercase()}_sort_chip")
+                ) { isFocused ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Sort,
+                            contentDescription = "Change sort order",
+                            tint = if (isFocused) OnCyanDark else BroadcastCyan,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = "Sort: ${sortMode.label}",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (isFocused) OnCyanDark else TextPrimary,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
+
             item(key = "pill_all") {
                 CategoryFilterPill(
                     label = "All (${typeItems.size})",
@@ -227,7 +304,7 @@ fun VodOrSeriesGridScreen(
                 .fillMaxSize()
                 .testTag("${contentType.name.lowercase()}_poster_grid")
         ) {
-            itemsIndexed(filteredItems, key = { _, item -> item.id }) { index, item ->
+            itemsIndexed(sortedFilteredItems, key = { _, item -> item.id }) { index, item ->
                 TvPosterCard(
                     item = item,
                     onClick = { onSelectItem(item) },
@@ -252,7 +329,10 @@ fun FavoritesScreen(
 ) {
     val favoriteItems = remember(allItems) { allItems.filter { it.isFavorite } }
     val favLive = remember(favoriteItems) { favoriteItems.filter { it.type == ContentType.LIVE } }
-    val favVodAndSeries = remember(favoriteItems) { favoriteItems.filter { it.type != ContentType.LIVE } }
+    val favVodAndSeries = remember(favoriteItems) {
+        favoriteItems.filter { it.type != ContentType.LIVE }
+            .sortedByDescending { it.addedAt }
+    }
     val firstFavFocus = remember { FocusRequester() }
 
     LaunchedEffect(favoriteItems.isNotEmpty()) {
@@ -390,8 +470,10 @@ fun MediaDetailScreen(
 ) {
     BackHandler { onBack() }
 
+    val context = LocalContext.current
     var selectedSeasonIndex by remember(item.id, seriesSeasons.size) { mutableIntStateOf(0) }
     val primaryActionFocus = remember { FocusRequester() }
+    val displayRating = remember(item.rating) { formatDisplayRating(item.rating) }
 
     LaunchedEffect(seriesSeasons.size) {
         if (selectedSeasonIndex >= seriesSeasons.size) selectedSeasonIndex = 0
@@ -402,14 +484,22 @@ fun MediaDetailScreen(
         runCatching { primaryActionFocus.requestFocus() }
     }
 
+    val backdropRequest = remember(item.id, item.backdropUrl, item.posterUrl, item.streamHeaders) {
+        val url = item.backdropUrl.ifBlank { item.posterUrl }
+        buildPosterImageRequest(context, item.id + "_backdrop", url, item.streamHeaders)
+    }
+    val posterRequest = remember(item.id, item.posterUrl, item.streamHeaders) {
+        buildPosterImageRequest(context, item.id + "_detail_poster", item.posterUrl, item.streamHeaders)
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(ObsidianVoid)
     ) {
-        if (item.backdropUrl.isNotBlank() || item.posterUrl.isNotBlank()) {
+        if (backdropRequest != null) {
             AsyncImage(
-                model = item.backdropUrl.ifBlank { item.posterUrl },
+                model = backdropRequest,
                 contentDescription = "${item.title} backdrop",
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()
@@ -481,9 +571,9 @@ fun MediaDetailScreen(
                             tint = BroadcastCyan.copy(alpha = 0.5f),
                             modifier = Modifier.size(56.dp)
                         )
-                        if (item.posterUrl.isNotBlank()) {
+                        if (posterRequest != null) {
                             AsyncImage(
-                                model = item.posterUrl,
+                                model = posterRequest,
                                 contentDescription = "${item.title} poster",
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier.fillMaxSize()
@@ -518,9 +608,9 @@ fun MediaDetailScreen(
 
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                         if (item.year.isNotBlank()) TvBadge(text = item.year)
-                        if (item.rating.isNotBlank()) {
+                        if (displayRating != null) {
                             TvBadge(
-                                text = "★ ${item.rating}",
+                                text = "★ $displayRating",
                                 containerColor = SignalAmber.copy(alpha = 0.2f),
                                 contentColor = SignalAmber
                             )
@@ -685,10 +775,16 @@ private fun TvPosterCard(
     onFocused: (() -> Unit)? = null,
     testTag: String = ""
 ) {
+    val context = LocalContext.current
+    val displayRating = remember(item.rating) { formatDisplayRating(item.rating) }
+    val imageRequest = remember(item.id, item.posterUrl, item.streamHeaders) {
+        buildPosterImageRequest(context, item.id, item.posterUrl, item.streamHeaders)
+    }
+
     TvFocusableSurface(
         onClick = onClick,
         onFocused = onFocused,
-        focusScale = 1.06f,
+        focusScale = 1.055f,
         shape = RoundedCornerShape(10.dp),
         containerColor = ObsidianBase,
         focusedContainerColor = HighlightSlate,
@@ -699,7 +795,7 @@ private fun TvPosterCard(
         modifier = modifier.then(if (testTag.isNotBlank()) Modifier.testTag(testTag) else Modifier)
     ) { isFocused ->
         Column(modifier = Modifier.fillMaxWidth()) {
-            // Strict 2:3 Poster Frame tuned for 5-column TV grid readability
+            // Strict 2:3 Poster Frame with unique per-item Coil request & cache key
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -711,19 +807,21 @@ private fun TvPosterCard(
                     contentDescription = item.title,
                     tint = TextMuted.copy(alpha = 0.35f),
                     modifier = Modifier
-                        .size(38.dp)
+                        .size(36.dp)
                         .align(Alignment.Center)
                 )
-                if (item.posterUrl.isNotBlank()) {
-                    AsyncImage(
-                        model = item.posterUrl,
-                        contentDescription = "${item.title} poster",
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize()
-                    )
+                if (imageRequest != null) {
+                    key(item.id, item.posterUrl) {
+                        AsyncImage(
+                            model = imageRequest,
+                            contentDescription = "${item.title} poster",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
                 }
 
-                // Compact high-contrast rating & favorite overlay
+                // Rating Badge (hidden when rating is 0 or unavailable) + Favorite star
                 Row(
                     modifier = Modifier
                         .align(Alignment.TopStart)
@@ -732,7 +830,7 @@ private fun TvPosterCard(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    if (item.rating.isNotBlank()) {
+                    if (displayRating != null) {
                         Box(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(5.dp))
@@ -740,7 +838,7 @@ private fun TvPosterCard(
                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                         ) {
                             Text(
-                                text = "★ ${item.rating.take(4)}",
+                                text = "★ $displayRating",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = SignalAmber,
                                 fontWeight = FontWeight.Bold
@@ -773,22 +871,36 @@ private fun TvPosterCard(
                 }
             }
 
-            Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 7.dp)) {
+            // Generous bottom title footer so 5-column titles & descenders never vertically clip
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .defaultMinSize(minHeight = 58.dp)
+                    .padding(horizontal = 9.dp, vertical = 9.dp),
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
                 Text(
                     text = item.title,
-                    style = MaterialTheme.typography.labelLarge,
+                    style = MaterialTheme.typography.labelLarge.copy(
+                        fontSize = 13.sp,
+                        lineHeight = 17.sp
+                    ),
                     color = if (isFocused) TextPrimary else TextSecondary,
                     fontWeight = if (isFocused) FontWeight.Bold else FontWeight.Medium,
-                    maxLines = 1,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
+                Spacer(Modifier.height(4.dp))
                 val metaLine = buildList {
                     if (item.year.isNotBlank()) add(item.year)
                     if (item.resumePositionMs > 5_000L) add(formatDurationMs(item.resumePositionMs))
                 }.joinToString(" • ").ifBlank { item.type.label }
                 Text(
                     text = metaLine,
-                    style = MaterialTheme.typography.labelSmall,
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontSize = 11.sp,
+                        lineHeight = 14.sp
+                    ),
                     color = if (isFocused) BroadcastCyan else TextMuted,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -796,6 +908,62 @@ private fun TvPosterCard(
             }
         }
     }
+}
+
+private fun buildPosterImageRequest(
+    context: android.content.Context,
+    uniqueItemKey: String,
+    posterUrl: String,
+    headers: Map<String, String>
+): ImageRequest? {
+    val cleanUrl = posterUrl.trim()
+    if (cleanUrl.isBlank() ||
+        cleanUrl.equals("null", ignoreCase = true) ||
+        cleanUrl.equals("false", ignoreCase = true)
+    ) {
+        return null
+    }
+    val cacheKey = "poster_${uniqueItemKey}_${cleanUrl.hashCode()}"
+    val builder = ImageRequest.Builder(context)
+        .data(cleanUrl)
+        .memoryCacheKey(cacheKey)
+        .diskCacheKey(cacheKey)
+        .crossfade(true)
+
+    headers.forEach { (k, v) ->
+        if (k.isNotBlank() && v.isNotBlank()) {
+            builder.addHeader(k, v)
+        }
+    }
+    return builder.build()
+}
+
+private fun formatDisplayRating(raw: String): String? {
+    val cleaned = raw.trim()
+    if (cleaned.isBlank() || cleaned.equals("null", ignoreCase = true) || cleaned.equals("n/a", ignoreCase = true)) {
+        return null
+    }
+    val value = cleaned.toFloatOrNull() ?: return null
+    if (value <= 0f) return null
+    return if (value % 1f == 0f) {
+        String.format(Locale.US, "%.1f", value)
+    } else {
+        String.format(Locale.US, "%.1f", value)
+    }
+}
+
+private fun parseRatingFloat(raw: String): Float {
+    return raw.trim().toFloatOrNull()?.takeIf { it > 0f } ?: 0f
+}
+
+private fun extractReleaseYearInt(yearField: String, title: String): Int {
+    val direct = Regex("(19\\d{2}|20\\d{2})").find(yearField)?.groupValues?.getOrNull(1)?.toIntOrNull()
+    if (direct != null) return direct
+    return Regex("\\b(19\\d{2}|20\\d{2})\\b").find(title)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+}
+
+private fun extractNumericTailId(compositeId: String): Long {
+    return compositeId.substringAfterLast('_').filter(Char::isDigit).toLongOrNull() ?: 0L
 }
 
 @Composable
