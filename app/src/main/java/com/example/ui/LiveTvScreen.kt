@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
@@ -140,7 +141,10 @@ fun LiveTvScreen(
     onOpenFullScreen: (MediaItem, List<MediaItem>) -> Unit,
     onToggleFavorite: (MediaItem) -> Unit,
     onGoToPlaylists: () -> Unit,
-    onReopenFilter: () -> Unit
+    onReopenFilter: () -> Unit,
+    activePlaylistLabel: String = "",
+    playlistCount: Int = 0,
+    onOpenPlaylistSwitcher: () -> Unit = {}
 ) {
     val liveCategories = remember(selectedCategories) {
         selectedCategories.filter { it.type == ContentType.LIVE }
@@ -165,12 +169,13 @@ fun LiveTvScreen(
                 )
             )
             liveCategories.forEach { cat ->
+                val compositeKey = "${cat.sourceId}::${cat.id}"
                 add(
                     GroupDrawerEntry(
-                        id = cat.id,
+                        id = compositeKey,
                         name = cat.name,
                         subtitle = cat.countryGroup,
-                        count = allLiveChannels.count { it.categoryId == cat.id }
+                        count = allLiveChannels.count { it.sourceId == cat.sourceId && it.categoryId == cat.id }
                     )
                 )
             }
@@ -181,7 +186,9 @@ fun LiveTvScreen(
         when (selectedCategoryId) {
             "ALL" -> allLiveChannels
             "FAVORITES" -> allLiveChannels.filter { it.isFavorite }
-            else -> allLiveChannels.filter { it.categoryId == selectedCategoryId }
+            else -> allLiveChannels.filter { ch ->
+                "${ch.sourceId}::${ch.categoryId}" == selectedCategoryId || ch.categoryId == selectedCategoryId
+            }
         }
     }
 
@@ -192,8 +199,11 @@ fun LiveTvScreen(
     if (allLiveChannels.isEmpty()) {
         LiveTvEmptyState(
             hasCategories = liveCategories.isNotEmpty(),
+            activePlaylistLabel = activePlaylistLabel,
+            playlistCount = playlistCount,
             onGoToPlaylists = onGoToPlaylists,
-            onReopenFilter = onReopenFilter
+            onReopenFilter = onReopenFilter,
+            onOpenPlaylistSwitcher = onOpenPlaylistSwitcher
         )
         return
     }
@@ -350,46 +360,84 @@ fun LiveTvScreen(
                         .padding(horizontal = 18.dp, vertical = 14.dp),
                     verticalArrangement = Arrangement.SpaceBetween
                 ) {
-                    // Header bar: Group Switcher pill + Favorite & Filter controls
+                    // Header bar: Group Switcher + Playlist Switcher + Favorite & Filter controls
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        TvFocusableSurface(
-                            onClick = { isGroupDrawerOpen = true },
-                            focusScale = 1.03f,
-                            shape = RoundedCornerShape(8.dp),
-                            containerColor = MidnightPanel,
-                            focusedContainerColor = HighlightSlate,
-                            borderColor = DividerSlate.copy(alpha = 0.5f),
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
-                            modifier = Modifier.testTag("live_group_switcher_button")
-                        ) { isFocused ->
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.List,
-                                    contentDescription = "Switch group",
-                                    tint = if (isFocused) TextPrimary else BroadcastCyan,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(Modifier.width(8.dp))
-                                Text(
-                                    text = "$activeGroupName (${filteredChannels.size})",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = TextPrimary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Spacer(Modifier.width(4.dp))
-                                Icon(
-                                    imageVector = Icons.Default.ChevronRight,
-                                    contentDescription = null,
-                                    tint = TextMuted,
-                                    modifier = Modifier.size(16.dp)
-                                )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            TvFocusableSurface(
+                                onClick = { isGroupDrawerOpen = true },
+                                focusScale = 1.03f,
+                                shape = RoundedCornerShape(8.dp),
+                                containerColor = MidnightPanel,
+                                focusedContainerColor = HighlightSlate,
+                                borderColor = DividerSlate.copy(alpha = 0.5f),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
+                                modifier = Modifier.testTag("live_group_switcher_button")
+                            ) { isFocused ->
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Filled.List,
+                                        contentDescription = "Switch group",
+                                        tint = if (isFocused) TextPrimary else BroadcastCyan,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(
+                                        text = "$activeGroupName (${filteredChannels.size})",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = TextPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Spacer(Modifier.width(4.dp))
+                                    Icon(
+                                        imageVector = Icons.Default.ChevronRight,
+                                        contentDescription = null,
+                                        tint = TextMuted,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+
+                            if (playlistCount > 1 && activePlaylistLabel.isNotBlank()) {
+                                TvFocusableSurface(
+                                    onClick = onOpenPlaylistSwitcher,
+                                    focusScale = 1.03f,
+                                    shape = RoundedCornerShape(8.dp),
+                                    containerColor = BroadcastCyanDeep.copy(alpha = 0.28f),
+                                    focusedContainerColor = HighlightSlate,
+                                    borderColor = BroadcastCyan.copy(alpha = 0.45f),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 7.dp),
+                                    modifier = Modifier.testTag("live_playlist_switcher_button")
+                                ) { isFocused ->
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(
+                                            imageVector = Icons.Default.SwapHoriz,
+                                            contentDescription = "Switch playlist",
+                                            tint = if (isFocused) TextPrimary else BroadcastCyan,
+                                            modifier = Modifier.size(17.dp)
+                                        )
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(
+                                            text = activePlaylistLabel,
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = TextPrimary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
                             }
                         }
+
+                        Spacer(Modifier.width(8.dp))
 
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             if (activePreview != null) {
@@ -890,6 +938,7 @@ fun ChannelLogoThumbnail(
     logoUrl: String,
     modifier: Modifier = Modifier
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(7.dp))
@@ -910,8 +959,15 @@ fun ChannelLogoThumbnail(
             fontWeight = FontWeight.Bold
         )
         if (logoUrl.isNotBlank()) {
+            val logoRequest = remember(logoUrl) {
+                coil.request.ImageRequest.Builder(context)
+                    .data(logoUrl)
+                    .size(96, 96)
+                    .crossfade(false)
+                    .build()
+            }
             AsyncImage(
-                model = logoUrl,
+                model = logoRequest,
                 contentDescription = "$title logo",
                 contentScale = ContentScale.Fit,
                 modifier = Modifier
@@ -991,8 +1047,11 @@ private fun LivePreviewVideoPlayer(
 @Composable
 private fun LiveTvEmptyState(
     hasCategories: Boolean,
+    activePlaylistLabel: String,
+    playlistCount: Int,
     onGoToPlaylists: () -> Unit,
-    onReopenFilter: () -> Unit
+    onReopenFilter: () -> Unit,
+    onOpenPlaylistSwitcher: () -> Unit
 ) {
     val addBtnFocus = remember { FocusRequester() }
     LaunchedEffect(Unit) {
@@ -1028,39 +1087,62 @@ private fun LiveTvEmptyState(
             modifier = Modifier
                 .align(Alignment.CenterStart)
                 .padding(horizontal = 56.dp)
-                .width(620.dp),
+                .width(640.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Icon(Icons.Default.LiveTv, contentDescription = "Live TV", tint = BroadcastCyan, modifier = Modifier.size(34.dp))
-                TvBadge(text = "ANDROID TV • 10-FOOT BROADCAST MODE")
+                TvBadge(text = if (playlistCount > 0 && activePlaylistLabel.isNotBlank()) "PLAYLIST: $activePlaylistLabel" else "ANDROID TV • 10-FOOT BROADCAST MODE")
             }
             Text(
-                text = "Welcome to TiviWave TV",
+                text = if (playlistCount > 1) "No Live Channels in $activePlaylistLabel" else "Welcome to TiviWave TV",
                 style = MaterialTheme.typography.displaySmall,
                 color = TextPrimary
             )
             Text(
-                text = "Connect your Stalker Portal (MAG/STB), Xtream Codes API, M3U/M3U8 URL or File, or GitHub Gist JSON playlist. Use the 2-Step Country & Category Pre-Load Filter to import only the groups you watch.",
+                text = if (playlistCount > 1) {
+                    "Switch to another saved playlist (Xtream / Stalker / M3U) or open the Category Filter to select Live TV groups for this playlist."
+                } else {
+                    "Connect your Stalker Portal (MAG/STB), Xtream Codes API, M3U/M3U8 URL or File, or GitHub Gist JSON playlist. Use the 2-Step Country & Category Pre-Load Filter to import only the groups you watch."
+                },
                 style = MaterialTheme.typography.bodyLarge,
                 color = TextSecondary
             )
             Spacer(Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                TvActionButton(
-                    text = "Add IPTV Playlist",
-                    icon = Icons.Default.AddCircle,
-                    isPrimary = true,
-                    onClick = onGoToPlaylists,
-                    modifier = Modifier.focusRequester(addBtnFocus),
-                    testTag = "empty_add_playlist_button"
-                )
-                if (hasCategories) {
+                if (playlistCount > 1) {
+                    TvActionButton(
+                        text = "Switch Playlist",
+                        icon = Icons.Default.SwapHoriz,
+                        isPrimary = true,
+                        onClick = onOpenPlaylistSwitcher,
+                        modifier = Modifier.focusRequester(addBtnFocus),
+                        testTag = "empty_switch_playlist_button"
+                    )
+                } else {
+                    TvActionButton(
+                        text = "Add IPTV Playlist",
+                        icon = Icons.Default.AddCircle,
+                        isPrimary = true,
+                        onClick = onGoToPlaylists,
+                        modifier = Modifier.focusRequester(addBtnFocus),
+                        testTag = "empty_add_playlist_button"
+                    )
+                }
+                if (hasCategories || playlistCount > 0) {
                     TvActionButton(
                         text = "Edit Category Filter",
                         icon = Icons.Default.Tune,
                         onClick = onReopenFilter,
                         testTag = "empty_reopen_filter_button"
+                    )
+                }
+                if (playlistCount > 1) {
+                    TvActionButton(
+                        text = "Manage Playlists",
+                        icon = Icons.Default.AddCircle,
+                        onClick = onGoToPlaylists,
+                        testTag = "empty_manage_playlists_button"
                     )
                 }
             }

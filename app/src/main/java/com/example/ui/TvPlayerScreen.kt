@@ -6,13 +6,12 @@ import androidx.annotation.OptIn
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,6 +26,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
@@ -69,6 +69,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -110,6 +111,7 @@ import com.example.ui.theme.SignalAmber
 import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -145,10 +147,8 @@ fun TvPlayerScreen(
     val scope = rememberCoroutineScope()
 
     val rootFocusRequester = remember { FocusRequester() }
-    val overlayActiveItemFocus = remember { FocusRequester() }
     val settingsFirstButtonFocus = remember { FocusRequester() }
     val trackPickerFirstFocus = remember { FocusRequester() }
-    val overlayListState = rememberLazyListState()
 
     val isLive = item.type == ContentType.LIVE
     var showOsdBanner by remember { mutableStateOf(true) }
@@ -190,19 +190,6 @@ fun TvPlayerScreen(
         if (showOsdBanner && !hasAnyInteractiveOverlay) {
             delay(5000L)
             showOsdBanner = false
-        }
-    }
-
-    // Immediately transfer focus to the active/first channel row when Live Channels Overlay opens
-    val activeOverlayTargetIndex = remember(liveZapQueue, item.id) {
-        liveZapQueue.indexOfFirst { it.id == item.id }.coerceAtLeast(0)
-    }
-
-    LaunchedEffect(showChannelOverlay) {
-        if (showChannelOverlay && liveZapQueue.isNotEmpty()) {
-            overlayListState.scrollToItem(activeOverlayTargetIndex)
-            delay(80L)
-            runCatching { overlayActiveItemFocus.requestFocus() }
         }
     }
 
@@ -355,7 +342,9 @@ fun TvPlayerScreen(
         }
     }
 
-    LaunchedEffect(exoPlayer, item.id) {
+    // Only poll playback position for VOD/Series so Live TV avoids unnecessary 1-second recompositions
+    LaunchedEffect(exoPlayer, item.id, isLive) {
+        if (isLive) return@LaunchedEffect
         var tick = 0
         while (true) {
             delay(1000L)
@@ -363,7 +352,7 @@ fun TvPlayerScreen(
             val d = exoPlayer.duration
             if (d > 0L && d != C.TIME_UNSET) durationMs = d
             tick++
-            if (!isLive && tick % 10 == 0 && currentPosMs > 5_000L) {
+            if (tick % 10 == 0 && currentPosMs > 5_000L) {
                 onSaveResumePosition(item.id, currentPosMs, durationMs)
             }
         }
@@ -579,149 +568,25 @@ fun TvPlayerScreen(
         }
 
         // ---------------------------------------------------------------------
-        // LIVE CHANNELS OVERLAY DRAWER (FIXED D-PAD FOCUS & SELECTION)
+        // LIVE CHANNELS OVERLAY DRAWER (ULTRA-SMOOTH, ZERO-LAG D-PAD INDEXING)
         // ---------------------------------------------------------------------
-        AnimatedVisibility(
-            visible = isLive && showChannelOverlay,
-            enter = slideInHorizontally { -it } + fadeIn(),
-            exit = slideOutHorizontally { -it } + fadeOut(),
-            modifier = Modifier
-                .align(Alignment.CenterStart)
-                .fillMaxHeight()
-                .width(430.dp)
-        ) {
-            Column(
+        if (isLive && showChannelOverlay) {
+            LiveChannelsOverlayDrawer(
+                channels = liveZapQueue,
+                currentChannelId = item.id,
+                epgByChannelId = epgByChannelId,
+                onSelectChannel = { selected ->
+                    showChannelOverlay = false
+                    if (selected.id != item.id) {
+                        onSwitchLiveChannel(selected)
+                    }
+                },
+                onClose = { showChannelOverlay = false },
                 modifier = Modifier
-                    .fillMaxSize()
-                    .background(ObsidianVoid.copy(alpha = 0.90f))
-                    .border(1.dp, DividerSlate.copy(alpha = 0.6f))
-                    .padding(horizontal = 16.dp, vertical = 18.dp)
-                    .testTag("live_channels_overlay")
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column {
-                        Text(
-                            text = "Live Channels",
-                            style = MaterialTheme.typography.titleLarge,
-                            color = TextPrimary
-                        )
-                        Text(
-                            text = "${liveZapQueue.size} channels • Back to close",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = TextMuted
-                        )
-                    }
-                    TvActionButton(
-                        text = "Close",
-                        onClick = { showChannelOverlay = false },
-                        testTag = "player_overlay_close_button"
-                    )
-                }
-
-                Spacer(Modifier.height(12.dp))
-
-                LazyColumn(
-                    state = overlayListState,
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                    contentPadding = PaddingValues(vertical = 4.dp),
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .testTag("live_channels_overlay_list")
-                ) {
-                    itemsIndexed(liveZapQueue, key = { _, ch -> ch.id }) { index, ch ->
-                        val chEpgKey = ch.epgChannelId.ifBlank { ch.id }
-                        val chNow = epgByChannelId[chEpgKey]?.firstOrNull { it.isCurrentAt(nowMs) }
-                            ?: epgByChannelId[chEpgKey]?.firstOrNull()
-                        val isCurrent = ch.id == item.id
-
-                        TvFocusableSurface(
-                            onClick = {
-                                showChannelOverlay = false
-                                if (ch.id != item.id) {
-                                    onSwitchLiveChannel(ch)
-                                }
-                            },
-                            onFocused = {
-                                scope.launch {
-                                    overlayListState.animateScrollToItem(index)
-                                }
-                            },
-                            selected = isCurrent,
-                            focusScale = 1.025f,
-                            shape = RoundedCornerShape(8.dp),
-                            containerColor = ObsidianBase.copy(alpha = 0.82f),
-                            selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.42f),
-                            focusedContainerColor = HighlightSlate,
-                            borderColor = Color.Transparent,
-                            focusedBorderColor = BroadcastCyan,
-                            focusedBorderWidth = 2.dp,
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .then(
-                                    if (index == activeOverlayTargetIndex) {
-                                        Modifier.focusRequester(overlayActiveItemFocus)
-                                    } else {
-                                        Modifier
-                                    }
-                                )
-                                .testTag("overlay_channel_${ch.id}")
-                        ) { isFocused ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = if (ch.channelNumber > 0) {
-                                        ch.channelNumber.toString().padStart(3, '0')
-                                    } else {
-                                        (index + 1).toString().padStart(3, '0')
-                                    },
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = if (isFocused || isCurrent) BroadcastCyan else TextMuted,
-                                    modifier = Modifier.width(34.dp)
-                                )
-                                ChannelLogoThumbnail(
-                                    title = ch.title,
-                                    logoUrl = ch.posterUrl,
-                                    modifier = Modifier.size(38.dp)
-                                )
-                                Spacer(Modifier.width(10.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = ch.title,
-                                        style = MaterialTheme.typography.titleSmall,
-                                        color = if (isFocused || isCurrent) TextPrimary else TextSecondary,
-                                        fontWeight = if (isFocused || isCurrent) FontWeight.Bold else FontWeight.Medium,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    Text(
-                                        text = chNow?.title ?: "Live Stream",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = if (isFocused) TextSecondary else TextMuted,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                                if (isCurrent) {
-                                    Spacer(Modifier.width(6.dp))
-                                    Box(
-                                        modifier = Modifier
-                                            .size(8.dp)
-                                            .clip(CircleShape)
-                                            .background(BroadcastCyan)
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+                    .align(Alignment.CenterStart)
+                    .fillMaxHeight()
+                    .width(430.dp)
+            )
         }
 
         // ---------------------------------------------------------------------
@@ -1048,6 +913,358 @@ fun TvPlayerScreen(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LiveChannelsOverlayDrawer(
+    channels: List<MediaItem>,
+    currentChannelId: String,
+    epgByChannelId: Map<String, List<EpgProgram>>,
+    onSelectChannel: (MediaItem) -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val overlayFocusRequester = remember { FocusRequester() }
+    val scope = rememberCoroutineScope()
+    val openedAtMs = remember { System.currentTimeMillis() }
+
+    val initialIndex = remember(channels, currentChannelId) {
+        channels.indexOfFirst { it.id == currentChannelId }.coerceAtLeast(0)
+    }
+    var focusedIndex by remember(channels) { mutableIntStateOf(initialIndex) }
+    val listState = rememberLazyListState(
+        initialFirstVisibleItemIndex = (initialIndex - 3).coerceAtLeast(0)
+    )
+    var activeScrollJob by remember { mutableStateOf<Job?>(null) }
+
+    LaunchedEffect(channels.size) {
+        if (channels.isNotEmpty() && focusedIndex !in channels.indices) {
+            focusedIndex = focusedIndex.coerceIn(0, channels.lastIndex)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        runCatching { overlayFocusRequester.requestFocus() }
+        delay(50L)
+        runCatching { overlayFocusRequester.requestFocus() }
+    }
+
+    fun moveSelection(delta: Int) {
+        if (channels.isEmpty()) return
+        val next = (focusedIndex + delta).coerceIn(0, channels.lastIndex)
+        if (next != focusedIndex) {
+            focusedIndex = next
+            activeScrollJob?.cancel()
+            activeScrollJob = scope.launch {
+                scrollFocusedChannelIntoView(
+                    listState = listState,
+                    targetIndex = next,
+                    totalCount = channels.size
+                )
+            }
+        }
+    }
+
+    Column(
+        modifier = modifier
+            .background(ObsidianVoid.copy(alpha = 0.92f))
+            .border(1.dp, DividerSlate.copy(alpha = 0.6f))
+            .padding(horizontal = 16.dp, vertical = 16.dp)
+            .focusRequester(overlayFocusRequester)
+            .focusable()
+            .onPreviewKeyEvent { keyEvent ->
+                val code = keyEvent.nativeKeyEvent.keyCode
+                if (keyEvent.type == KeyEventType.KeyUp) {
+                    return@onPreviewKeyEvent when (code) {
+                        AndroidKeyEvent.KEYCODE_DPAD_UP,
+                        AndroidKeyEvent.KEYCODE_DPAD_DOWN,
+                        AndroidKeyEvent.KEYCODE_DPAD_LEFT,
+                        AndroidKeyEvent.KEYCODE_DPAD_RIGHT,
+                        AndroidKeyEvent.KEYCODE_DPAD_CENTER,
+                        AndroidKeyEvent.KEYCODE_ENTER,
+                        AndroidKeyEvent.KEYCODE_NUMPAD_ENTER,
+                        AndroidKeyEvent.KEYCODE_CHANNEL_UP,
+                        AndroidKeyEvent.KEYCODE_CHANNEL_DOWN,
+                        AndroidKeyEvent.KEYCODE_PAGE_UP,
+                        AndroidKeyEvent.KEYCODE_PAGE_DOWN -> true
+                        else -> false
+                    }
+                }
+                if (keyEvent.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+
+                when (code) {
+                    AndroidKeyEvent.KEYCODE_DPAD_DOWN -> {
+                        moveSelection(+1)
+                        true
+                    }
+
+                    AndroidKeyEvent.KEYCODE_DPAD_UP -> {
+                        moveSelection(-1)
+                        true
+                    }
+
+                    AndroidKeyEvent.KEYCODE_CHANNEL_DOWN,
+                    AndroidKeyEvent.KEYCODE_PAGE_DOWN -> {
+                        moveSelection(+8)
+                        true
+                    }
+
+                    AndroidKeyEvent.KEYCODE_CHANNEL_UP,
+                    AndroidKeyEvent.KEYCODE_PAGE_UP -> {
+                        moveSelection(-8)
+                        true
+                    }
+
+                    AndroidKeyEvent.KEYCODE_DPAD_CENTER,
+                    AndroidKeyEvent.KEYCODE_ENTER,
+                    AndroidKeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                        if (keyEvent.nativeKeyEvent.repeatCount == 0) {
+                            channels.getOrNull(focusedIndex)?.let(onSelectChannel)
+                        }
+                        true
+                    }
+
+                    AndroidKeyEvent.KEYCODE_BACK,
+                    AndroidKeyEvent.KEYCODE_ESCAPE -> {
+                        onClose()
+                        true
+                    }
+
+                    AndroidKeyEvent.KEYCODE_DPAD_LEFT,
+                    AndroidKeyEvent.KEYCODE_DPAD_RIGHT -> {
+                        // Trap horizontal D-Pad presses so diagonal bumps never steal focus out of the list
+                        true
+                    }
+
+                    else -> false
+                }
+            }
+            .testTag("live_channels_overlay")
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Live Channels",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = TextPrimary,
+                    maxLines = 1
+                )
+                Text(
+                    text = if (channels.isNotEmpty()) {
+                        "${focusedIndex + 1} / ${channels.size} • ▲▼ Move • OK Watch"
+                    } else {
+                        "No channels available"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextMuted,
+                    maxLines = 1
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(ElevatedSlate)
+                    .border(1.dp, DividerSlate.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                    .pointerInput(onClose) {
+                        detectTapGestures(onTap = { onClose() })
+                    }
+                    .padding(horizontal = 12.dp, vertical = 7.dp)
+                    .testTag("player_overlay_close_button")
+            ) {
+                Text(
+                    text = "Back • Close",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TextSecondary
+                )
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        LazyColumn(
+            state = listState,
+            verticalArrangement = Arrangement.spacedBy(5.dp),
+            contentPadding = PaddingValues(vertical = 2.dp),
+            modifier = Modifier
+                .fillMaxSize()
+                .testTag("live_channels_overlay_list")
+        ) {
+            itemsIndexed(
+                items = channels,
+                key = { _, ch -> ch.id }
+            ) { index, ch ->
+                val isCurrent = ch.id == currentChannelId
+                val isFocused = index == focusedIndex
+                val programTitle = remember(ch.id, epgByChannelId, openedAtMs) {
+                    val chEpgKey = ch.epgChannelId.ifBlank { ch.id }
+                    val programs = epgByChannelId[chEpgKey]
+                    val current = programs?.firstOrNull { it.isCurrentAt(openedAtMs) }
+                        ?: programs?.firstOrNull()
+                    current?.title ?: "Live Stream"
+                }
+
+                OverlayChannelRow(
+                    channel = ch,
+                    index = index,
+                    isCurrent = isCurrent,
+                    isFocused = isFocused,
+                    programTitle = programTitle,
+                    onSelect = {
+                        focusedIndex = index
+                        onSelectChannel(ch)
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun OverlayChannelRow(
+    channel: MediaItem,
+    index: Int,
+    isCurrent: Boolean,
+    isFocused: Boolean,
+    programTitle: String,
+    onSelect: () -> Unit
+) {
+    val bgColor = when {
+        isFocused -> HighlightSlate
+        isCurrent -> BroadcastCyanDeep.copy(alpha = 0.36f)
+        else -> ObsidianBase.copy(alpha = 0.78f)
+    }
+    val borderColor = when {
+        isFocused -> BroadcastCyan
+        isCurrent -> BroadcastCyan.copy(alpha = 0.35f)
+        else -> Color.Transparent
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(58.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(bgColor)
+            .border(
+                width = if (isFocused) 1.5.dp else 1.dp,
+                color = borderColor,
+                shape = RoundedCornerShape(8.dp)
+            )
+            .pointerInput(channel.id, onSelect) {
+                detectTapGestures(onTap = { onSelect() })
+            }
+            .padding(horizontal = 10.dp)
+            .testTag("overlay_channel_${channel.id}"),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (isFocused) {
+            Box(
+                modifier = Modifier
+                    .width(3.dp)
+                    .height(30.dp)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(BroadcastCyan)
+            )
+            Spacer(Modifier.width(8.dp))
+        }
+        Text(
+            text = if (channel.channelNumber > 0) {
+                channel.channelNumber.toString().padStart(3, '0')
+            } else {
+                (index + 1).toString().padStart(3, '0')
+            },
+            style = MaterialTheme.typography.labelMedium,
+            color = if (isFocused || isCurrent) BroadcastCyan else TextMuted,
+            modifier = Modifier.width(34.dp)
+        )
+        ChannelLogoThumbnail(
+            title = channel.title,
+            logoUrl = channel.posterUrl,
+            modifier = Modifier.size(36.dp)
+        )
+        Spacer(Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = channel.title,
+                style = MaterialTheme.typography.titleSmall,
+                color = if (isFocused || isCurrent) TextPrimary else TextSecondary,
+                fontWeight = if (isFocused || isCurrent) FontWeight.Bold else FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = programTitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (isFocused) TextSecondary else TextMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        if (isCurrent) {
+            Spacer(Modifier.width(6.dp))
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(BroadcastCyan)
+            )
+        }
+    }
+}
+
+private suspend fun scrollFocusedChannelIntoView(
+    listState: LazyListState,
+    targetIndex: Int,
+    totalCount: Int
+) {
+    if (totalCount <= 0) return
+    val layoutInfo = listState.layoutInfo
+    val visibleItems = layoutInfo.visibleItemsInfo
+    if (visibleItems.isEmpty()) {
+        listState.scrollToItem((targetIndex - 3).coerceAtLeast(0))
+        return
+    }
+
+    val viewportStart = layoutInfo.viewportStartOffset
+    val viewportEnd = layoutInfo.viewportEndOffset
+    val fullyVisible = visibleItems.filter { info ->
+        info.offset >= viewportStart && (info.offset + info.size) <= viewportEnd
+    }
+    val firstFullIndex = fullyVisible.firstOrNull()?.index ?: visibleItems.first().index
+    val lastFullIndex = fullyVisible.lastOrNull()?.index ?: visibleItems.last().index
+    val fullCount = (lastFullIndex - firstFullIndex + 1).coerceAtLeast(1)
+    val margin = when {
+        fullCount >= 6 -> 2
+        fullCount >= 4 -> 1
+        else -> 0
+    }
+
+    when {
+        targetIndex < firstFullIndex - 2 || targetIndex > lastFullIndex + 2 -> {
+            val desiredFirst = (targetIndex - (fullCount / 2)).coerceIn(0, (totalCount - 1).coerceAtLeast(0))
+            listState.scrollToItem(desiredFirst)
+        }
+
+        targetIndex < firstFullIndex + margin -> {
+            val desiredFirst = (targetIndex - margin).coerceAtLeast(0)
+            if (desiredFirst != listState.firstVisibleItemIndex || listState.firstVisibleItemScrollOffset != 0) {
+                listState.scrollToItem(desiredFirst)
+            }
+        }
+
+        targetIndex > lastFullIndex - margin -> {
+            val maxFirst = (totalCount - fullCount).coerceAtLeast(0)
+            val desiredFirst = (targetIndex - (fullCount - 1 - margin)).coerceIn(0, maxFirst)
+            if (desiredFirst != listState.firstVisibleItemIndex || listState.firstVisibleItemScrollOffset != 0) {
+                listState.scrollToItem(desiredFirst)
             }
         }
     }

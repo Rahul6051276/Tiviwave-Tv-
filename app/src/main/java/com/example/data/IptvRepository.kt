@@ -41,10 +41,26 @@ class IptvRepository(context: Context) {
         dao.upsertPlaylist(source.toEntity())
     }
 
+    /**
+     * Switches the active playlist without deleting or altering any other saved playlists.
+     * Pass null to enable "All Playlists (Combined)" mode.
+     */
+    suspend fun setActivePlaylist(sourceId: String?) {
+        if (sourceId == null) {
+            dao.setAllPlaylistsActive()
+        } else {
+            dao.setSingleActivePlaylist(sourceId)
+        }
+    }
+
     suspend fun deletePlaylist(sourceId: String) {
         dao.deleteMediaItemsForSource(sourceId)
         dao.deleteCategoriesForSource(sourceId)
         dao.deletePlaylist(sourceId)
+        val remaining = dao.getAllPlaylists()
+        if (remaining.isNotEmpty() && remaining.none { it.isActive }) {
+            dao.setSingleActivePlaylist(remaining.first().id)
+        }
     }
 
     /**
@@ -114,7 +130,8 @@ class IptvRepository(context: Context) {
             cat.copy(itemCount = countsByCat[cat.id] ?: if (cat.isSelected) 0 else cat.itemCount)
         }
 
-        dao.upsertPlaylist(source.copy(lastSyncedAt = System.currentTimeMillis()).toEntity())
+        dao.upsertPlaylist(source.copy(lastSyncedAt = System.currentTimeMillis(), isActive = true).toEntity())
+        dao.setSingleActivePlaylist(source.id)
         dao.deleteCategoriesForSource(source.id)
         dao.upsertCategories(finalizedCategories.map { it.toEntity() })
         dao.deleteMediaItemsForSource(source.id)

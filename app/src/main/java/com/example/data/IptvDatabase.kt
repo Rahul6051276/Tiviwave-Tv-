@@ -97,11 +97,20 @@ interface IptvDao {
     @Query("SELECT * FROM playlist_sources ORDER BY lastSyncedAt DESC")
     fun observePlaylists(): Flow<List<PlaylistSourceEntity>>
 
+    @Query("SELECT * FROM playlist_sources ORDER BY lastSyncedAt DESC")
+    suspend fun getAllPlaylists(): List<PlaylistSourceEntity>
+
     @Query("SELECT * FROM playlist_sources WHERE id = :id LIMIT 1")
     suspend fun getPlaylistById(id: String): PlaylistSourceEntity?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertPlaylist(entity: PlaylistSourceEntity)
+
+    @Query("UPDATE playlist_sources SET isActive = CASE WHEN id = :sourceId THEN 1 ELSE 0 END")
+    suspend fun setSingleActivePlaylist(sourceId: String)
+
+    @Query("UPDATE playlist_sources SET isActive = 1")
+    suspend fun setAllPlaylistsActive()
 
     @Query("DELETE FROM playlist_sources WHERE id = :id")
     suspend fun deletePlaylist(id: String)

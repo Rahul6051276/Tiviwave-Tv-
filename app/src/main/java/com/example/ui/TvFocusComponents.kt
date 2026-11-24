@@ -8,9 +8,8 @@ import androidx.compose.animation.core.spring
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.focusable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -52,8 +51,11 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -82,7 +84,8 @@ fun isTvConfirmKey(nativeKeyCode: Int): Boolean {
 
 /**
  * Clean Android TV D-Pad Focusable Container.
- * Uses subtle resting surfaces without heavy clutter borders, and highlights the focused element
+ * Uses a single FocusTargetNode (avoiding duplicate .focusable + .clickable focus traps),
+ * subtle resting surfaces without heavy clutter borders, and highlights the focused element
  * with a crisp 2dp TV focus ring + smooth scale zoom + elevated zIndex.
  */
 @Composable
@@ -160,12 +163,19 @@ fun TvFocusableSurface(
                 }
             }
             .focusable(enabled = enabled)
-            .clickable(
-                enabled = enabled,
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-                onClick = onClick
-            )
+            .pointerInput(enabled, onClick) {
+                if (enabled) {
+                    detectTapGestures(onTap = { onClick() })
+                }
+            }
+            .semantics(mergeDescendants = true) {
+                if (enabled) {
+                    onClick {
+                        onClick()
+                        true
+                    }
+                }
+            }
     ) {
         Box(
             modifier = Modifier.padding(contentPadding),

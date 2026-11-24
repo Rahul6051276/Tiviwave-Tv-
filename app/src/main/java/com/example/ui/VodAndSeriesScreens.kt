@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Tv
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -109,7 +110,10 @@ fun VodOrSeriesGridScreen(
     onSelectCategory: (String) -> Unit,
     onSelectItem: (MediaItem) -> Unit,
     onGoToPlaylists: () -> Unit,
-    onReopenFilter: () -> Unit
+    onReopenFilter: () -> Unit,
+    activePlaylistLabel: String = "",
+    playlistCount: Int = 0,
+    onOpenPlaylistSwitcher: () -> Unit = {}
 ) {
     var sortMode by remember(contentType) { mutableStateOf(CatalogSortMode.LATEST_ADDED) }
 
@@ -124,7 +128,9 @@ fun VodOrSeriesGridScreen(
             "ALL" -> typeItems
             "FAVORITES" -> typeItems.filter { it.isFavorite }
             "CONTINUE" -> typeItems.filter { it.resumePositionMs > 5_000L }
-            else -> typeItems.filter { it.categoryId == selectedCategoryId }
+            else -> typeItems.filter { item ->
+                "${item.sourceId}::${item.categoryId}" == selectedCategoryId || item.categoryId == selectedCategoryId
+            }
         }
         when (sortMode) {
             CatalogSortMode.LATEST_ADDED -> filtered.sortedWith(
@@ -149,11 +155,23 @@ fun VodOrSeriesGridScreen(
 
     if (typeItems.isEmpty()) {
         MediaCatalogEmptyState(
-            title = if (contentType == ContentType.VOD) "No Movies Imported Yet" else "No Web Series Imported Yet",
-            subtitle = "Add a Stalker Portal, Xtream Codes, M3U, or Gist playlist and check your preferred ${contentType.label} categories in the Pre-Load Filter.",
+            title = if (playlistCount > 1 && activePlaylistLabel.isNotBlank()) {
+                "No ${contentType.label} in $activePlaylistLabel"
+            } else if (contentType == ContentType.VOD) {
+                "No Movies Imported Yet"
+            } else {
+                "No Web Series Imported Yet"
+            },
+            subtitle = if (playlistCount > 1) {
+                "Switch to another saved playlist (Xtream / Stalker / M3U) or open the Category Filter to enable ${contentType.label} groups."
+            } else {
+                "Add a Stalker Portal, Xtream Codes, M3U, or Gist playlist and check your preferred ${contentType.label} categories in the Pre-Load Filter."
+            },
             icon = if (contentType == ContentType.VOD) Icons.Default.Movie else Icons.Default.Tv,
+            playlistCount = playlistCount,
             onGoToPlaylists = onGoToPlaylists,
-            onReopenFilter = onReopenFilter
+            onReopenFilter = onReopenFilter,
+            onOpenPlaylistSwitcher = onOpenPlaylistSwitcher
         )
         return
     }
@@ -207,12 +225,23 @@ fun VodOrSeriesGridScreen(
                     contentColor = BroadcastCyan
                 )
             }
-            TvActionButton(
-                text = "Edit Categories",
-                icon = Icons.Default.FilterList,
-                onClick = onReopenFilter,
-                testTag = "${contentType.name.lowercase()}_edit_filter_button"
-            )
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (playlistCount > 1 && activePlaylistLabel.isNotBlank()) {
+                    TvActionButton(
+                        text = activePlaylistLabel,
+                        icon = Icons.Default.SwapHoriz,
+                        isPrimary = true,
+                        onClick = onOpenPlaylistSwitcher,
+                        testTag = "${contentType.name.lowercase()}_playlist_switcher_button"
+                    )
+                }
+                TvActionButton(
+                    text = "Edit Categories",
+                    icon = Icons.Default.FilterList,
+                    onClick = onReopenFilter,
+                    testTag = "${contentType.name.lowercase()}_edit_filter_button"
+                )
+            }
         }
 
         Spacer(Modifier.height(12.dp))
@@ -282,11 +311,12 @@ fun VodOrSeriesGridScreen(
                     onClick = { onSelectCategory("FAVORITES") }
                 )
             }
-            items(typeCategories, key = { it.id }) { cat ->
+            items(typeCategories, key = { "${it.sourceId}::${it.id}" }) { cat ->
+                val compositeKey = "${cat.sourceId}::${cat.id}"
                 CategoryFilterPill(
-                    label = "${cat.name} (${typeItems.count { it.categoryId == cat.id }})",
-                    selected = selectedCategoryId == cat.id,
-                    onClick = { onSelectCategory(cat.id) }
+                    label = "${cat.name} (${typeItems.count { it.sourceId == cat.sourceId && it.categoryId == cat.id }})",
+                    selected = selectedCategoryId == compositeKey,
+                    onClick = { onSelectCategory(compositeKey) }
                 )
             }
         }
@@ -1000,8 +1030,10 @@ private fun MediaCatalogEmptyState(
     title: String,
     subtitle: String,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
+    playlistCount: Int,
     onGoToPlaylists: () -> Unit,
-    onReopenFilter: () -> Unit
+    onReopenFilter: () -> Unit,
+    onOpenPlaylistSwitcher: () -> Unit
 ) {
     val addFocus = remember { FocusRequester() }
     LaunchedEffect(Unit) {
@@ -1017,7 +1049,7 @@ private fun MediaCatalogEmptyState(
     ) {
         Column(
             modifier = Modifier
-                .width(560.dp)
+                .width(600.dp)
                 .clip(RoundedCornerShape(14.dp))
                 .background(ObsidianBase)
                 .padding(32.dp),
@@ -1029,13 +1061,23 @@ private fun MediaCatalogEmptyState(
             Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
             Spacer(Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                TvActionButton(
-                    text = "Add Playlist",
-                    icon = Icons.Default.AddCircle,
-                    isPrimary = true,
-                    onClick = onGoToPlaylists,
-                    modifier = Modifier.focusRequester(addFocus)
-                )
+                if (playlistCount > 1) {
+                    TvActionButton(
+                        text = "Switch Playlist",
+                        icon = Icons.Default.SwapHoriz,
+                        isPrimary = true,
+                        onClick = onOpenPlaylistSwitcher,
+                        modifier = Modifier.focusRequester(addFocus)
+                    )
+                } else {
+                    TvActionButton(
+                        text = "Add Playlist",
+                        icon = Icons.Default.AddCircle,
+                        isPrimary = true,
+                        onClick = onGoToPlaylists,
+                        modifier = Modifier.focusRequester(addFocus)
+                    )
+                }
                 TvActionButton(
                     text = "Edit Category Filter",
                     icon = Icons.Default.FilterList,

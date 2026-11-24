@@ -2,6 +2,7 @@ package com.example.ui
 
 import android.app.Activity
 import android.content.Intent
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -34,6 +35,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.LiveTv
 import androidx.compose.material.icons.filled.Movie
@@ -43,6 +45,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Router
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Tv
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material3.CircularProgressIndicator
@@ -68,6 +71,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.models.ContentType
+import com.example.models.MediaItem
 import com.example.models.PlaylistSource
 import com.example.models.ProxyProtocol
 import com.example.models.RoutingNode
@@ -160,6 +164,7 @@ fun HomeTvScreen(
     }
 
     var isRailExpanded by remember { mutableStateOf(false) }
+    var showPlaylistSwitcher by remember { mutableStateOf(false) }
     val railWidth by animateDpAsState(
         targetValue = if (isRailExpanded) 244.dp else 78.dp,
         label = "tv_rail_width"
@@ -283,47 +288,97 @@ fun HomeTvScreen(
                     }
                 }
 
-                // Bottom Routing Status Indicator on Rail
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(if (uiState.routingState.isConnected) ConnectedEmerald.copy(alpha = 0.16f) else MidnightPanel)
-                        .border(
-                            1.dp,
-                            if (uiState.routingState.isConnected) ConnectedEmerald.copy(alpha = 0.5f) else DividerSlate.copy(alpha = 0.4f),
-                            RoundedCornerShape(10.dp)
-                        )
-                        .padding(10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = if (isRailExpanded) Arrangement.Start else Arrangement.Center
-                ) {
-                    Box(
+                // Bottom Quick Playlist Switcher + Routing Status Indicator on Rail
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (uiState.playlists.size > 1) {
+                        TvFocusableSurface(
+                            onClick = { showPlaylistSwitcher = true },
+                            selected = false,
+                            focusScale = 1.03f,
+                            shape = RoundedCornerShape(10.dp),
+                            containerColor = BroadcastCyanDeep.copy(alpha = 0.25f),
+                            focusedContainerColor = BroadcastCyan,
+                            borderColor = BroadcastCyan.copy(alpha = 0.45f),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("nav_rail_switch_playlist")
+                        ) { isFocused ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = if (isRailExpanded) Arrangement.Start else Arrangement.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.SwapHoriz,
+                                    contentDescription = "Switch Playlist",
+                                    tint = if (isFocused) OnCyanDark else BroadcastCyan,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                                if (isRailExpanded) {
+                                    Spacer(Modifier.width(10.dp))
+                                    Column {
+                                        Text(
+                                            text = uiState.activePlaylistLabel,
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = if (isFocused) OnCyanDark else TextPrimary,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = "Switch Playlist (${uiState.playlists.size})",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (isFocused) OnCyanDark.copy(alpha = 0.85f) else BroadcastCyan,
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Row(
                         modifier = Modifier
-                            .size(10.dp)
-                            .clip(CircleShape)
-                            .background(if (uiState.routingState.isConnected) ConnectedEmerald else TextMuted)
-                    )
-                    if (isRailExpanded) {
-                        Spacer(Modifier.width(10.dp))
-                        Column {
-                            Text(
-                                text = if (uiState.routingState.isConnected) {
-                                    uiState.routingState.activeNode?.countryName ?: "Proxy Active"
-                                } else {
-                                    "Direct Route"
-                                },
-                                style = MaterialTheme.typography.labelLarge,
-                                color = if (uiState.routingState.isConnected) ConnectedEmerald else TextSecondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (uiState.routingState.isConnected) ConnectedEmerald.copy(alpha = 0.16f) else MidnightPanel)
+                            .border(
+                                1.dp,
+                                if (uiState.routingState.isConnected) ConnectedEmerald.copy(alpha = 0.5f) else DividerSlate.copy(alpha = 0.4f),
+                                RoundedCornerShape(10.dp)
                             )
-                            Text(
-                                text = if (uiState.routingState.isConnected) "VPN / Proxy On" else "No Proxy",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = TextMuted,
-                                maxLines = 1
-                            )
+                            .padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = if (isRailExpanded) Arrangement.Start else Arrangement.Center
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(10.dp)
+                                .clip(CircleShape)
+                                .background(if (uiState.routingState.isConnected) ConnectedEmerald else TextMuted)
+                        )
+                        if (isRailExpanded) {
+                            Spacer(Modifier.width(10.dp))
+                            Column {
+                                Text(
+                                    text = if (uiState.routingState.isConnected) {
+                                        uiState.routingState.activeNode?.countryName ?: "Proxy Active"
+                                    } else {
+                                        "Direct Route"
+                                    },
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = if (uiState.routingState.isConnected) ConnectedEmerald else TextSecondary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = if (uiState.routingState.isConnected) "VPN / Proxy On" else "No Proxy",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextMuted,
+                                    maxLines = 1
+                                )
+                            }
                         }
                     }
                 }
@@ -337,10 +392,14 @@ fun HomeTvScreen(
                     .weight(1f)
                     .fillMaxHeight()
             ) {
+                val activeSourceForFilter = uiState.activePlaylist ?: uiState.playlists.firstOrNull()
+                val visibleCategories = uiState.visibleSelectedCategories
+                val visibleItems = uiState.visibleMediaItems
+
                 when (uiState.currentSection) {
                     TvSection.LIVE_TV -> LiveTvScreen(
-                        selectedCategories = uiState.selectedCategories,
-                        allLiveChannels = uiState.mediaItems.filter { it.type == ContentType.LIVE },
+                        selectedCategories = visibleCategories,
+                        allLiveChannels = visibleItems.filter { it.type == ContentType.LIVE },
                         selectedCategoryId = uiState.selectedLiveCategoryId,
                         previewChannel = uiState.previewChannel,
                         previewStream = uiState.previewStream,
@@ -352,47 +411,53 @@ fun HomeTvScreen(
                         onToggleFavorite = viewModel::toggleFavorite,
                         onGoToPlaylists = { viewModel.selectSection(TvSection.PLAYLISTS) },
                         onReopenFilter = {
-                            val activeSource = uiState.playlists.firstOrNull()
-                            if (activeSource != null) {
-                                viewModel.openCategoryFilterForExistingPlaylist(activeSource)
+                            if (activeSourceForFilter != null) {
+                                viewModel.openCategoryFilterForExistingPlaylist(activeSourceForFilter)
                             } else {
                                 viewModel.selectSection(TvSection.PLAYLISTS)
                             }
-                        }
+                        },
+                        activePlaylistLabel = uiState.activePlaylistLabel,
+                        playlistCount = uiState.playlists.size,
+                        onOpenPlaylistSwitcher = { showPlaylistSwitcher = true }
                     )
 
                     TvSection.MOVIES -> VodOrSeriesGridScreen(
                         contentType = ContentType.VOD,
-                        categories = uiState.selectedCategories,
-                        items = uiState.mediaItems,
+                        categories = visibleCategories,
+                        items = visibleItems,
                         selectedCategoryId = uiState.selectedVodCategoryId,
                         onSelectCategory = viewModel::selectVodCategory,
                         onSelectItem = viewModel::openMediaDetails,
                         onGoToPlaylists = { viewModel.selectSection(TvSection.PLAYLISTS) },
                         onReopenFilter = {
-                            val activeSource = uiState.playlists.firstOrNull()
-                            if (activeSource != null) viewModel.openCategoryFilterForExistingPlaylist(activeSource)
+                            if (activeSourceForFilter != null) viewModel.openCategoryFilterForExistingPlaylist(activeSourceForFilter)
                             else viewModel.selectSection(TvSection.PLAYLISTS)
-                        }
+                        },
+                        activePlaylistLabel = uiState.activePlaylistLabel,
+                        playlistCount = uiState.playlists.size,
+                        onOpenPlaylistSwitcher = { showPlaylistSwitcher = true }
                     )
 
                     TvSection.WEB_SERIES -> VodOrSeriesGridScreen(
                         contentType = ContentType.SERIES,
-                        categories = uiState.selectedCategories,
-                        items = uiState.mediaItems,
+                        categories = visibleCategories,
+                        items = visibleItems,
                         selectedCategoryId = uiState.selectedSeriesCategoryId,
                         onSelectCategory = viewModel::selectSeriesCategory,
                         onSelectItem = viewModel::openMediaDetails,
                         onGoToPlaylists = { viewModel.selectSection(TvSection.PLAYLISTS) },
                         onReopenFilter = {
-                            val activeSource = uiState.playlists.firstOrNull()
-                            if (activeSource != null) viewModel.openCategoryFilterForExistingPlaylist(activeSource)
+                            if (activeSourceForFilter != null) viewModel.openCategoryFilterForExistingPlaylist(activeSourceForFilter)
                             else viewModel.selectSection(TvSection.PLAYLISTS)
-                        }
+                        },
+                        activePlaylistLabel = uiState.activePlaylistLabel,
+                        playlistCount = uiState.playlists.size,
+                        onOpenPlaylistSwitcher = { showPlaylistSwitcher = true }
                     )
 
                     TvSection.FAVORITES -> FavoritesScreen(
-                        allItems = uiState.mediaItems,
+                        allItems = visibleItems,
                         onOpenLiveChannel = { ch, queue -> viewModel.openFullScreenPlayer(ch, queue) },
                         onOpenVodOrSeries = viewModel::openMediaDetails
                     )
@@ -412,8 +477,13 @@ fun HomeTvScreen(
 
                     TvSection.PLAYLISTS -> PlaylistsAndFilterManagerScreen(
                         playlists = uiState.playlists,
+                        activePlaylistId = uiState.activePlaylistId,
                         allCategories = uiState.allCategories,
+                        mediaItems = uiState.mediaItems,
                         onFetchAndFilter = viewModel::addOrEditPlaylistAndFetchCategories,
+                        onSelectActivePlaylist = { sourceId ->
+                            viewModel.selectActivePlaylist(sourceId, navigateToContent = true)
+                        },
                         onOpenSavedFilter = { src -> viewModel.openCategoryFilterForExistingPlaylist(src, refreshFromServer = false) },
                         onRefreshServerCategories = { src -> viewModel.openCategoryFilterForExistingPlaylist(src, refreshFromServer = true) },
                         onRefreshEpg = viewModel::refreshEpgForPlaylist,
@@ -421,6 +491,19 @@ fun HomeTvScreen(
                     )
                 }
             }
+        }
+
+        if (showPlaylistSwitcher && uiState.playlists.size > 1) {
+            PlaylistSwitcherOverlay(
+                playlists = uiState.playlists,
+                activePlaylistId = uiState.activePlaylistId,
+                mediaItems = uiState.mediaItems,
+                onSelectPlaylist = { id ->
+                    showPlaylistSwitcher = false
+                    viewModel.selectActivePlaylist(id, navigateToContent = false)
+                },
+                onClose = { showPlaylistSwitcher = false }
+            )
         }
 
         GlobalBusyAndStatusOverlay(
@@ -441,8 +524,11 @@ fun HomeTvScreen(
 @Composable
 private fun PlaylistsAndFilterManagerScreen(
     playlists: List<PlaylistSource>,
+    activePlaylistId: String?,
     allCategories: List<com.example.models.ContentCategory>,
+    mediaItems: List<MediaItem>,
     onFetchAndFilter: (PlaylistSource) -> Unit,
+    onSelectActivePlaylist: (String?) -> Unit,
     onOpenSavedFilter: (PlaylistSource) -> Unit,
     onRefreshServerCategories: (PlaylistSource) -> Unit,
     onRefreshEpg: (PlaylistSource) -> Unit,
@@ -451,7 +537,8 @@ private fun PlaylistsAndFilterManagerScreen(
     val context = LocalContext.current
     var sourceType by remember { mutableStateOf(SourceType.STALKER) }
     var name by remember { mutableStateOf("") }
-    var portalUrl by remember { mutableStateOf("") }
+    var stalkerPortalUrl by remember { mutableStateOf("") }
+    var xtreamServerUrl by remember { mutableStateOf("") }
     var macAddress by remember { mutableStateOf("00:1A:79:") }
     var serialNumber by remember { mutableStateOf("") }
     var deviceId1 by remember { mutableStateOf("") }
@@ -494,10 +581,10 @@ private fun PlaylistsAndFilterManagerScreen(
             .padding(horizontal = 24.dp, vertical = 18.dp),
         horizontalArrangement = Arrangement.spacedBy(20.dp)
     ) {
-        // Left Column (56%): Add New IPTV Source Form
+        // Left Column (54%): Add New IPTV Source Form
         Column(
             modifier = Modifier
-                .weight(0.56f)
+                .weight(0.54f)
                 .fillMaxHeight()
                 .clip(RoundedCornerShape(16.dp))
                 .background(ObsidianBase)
@@ -508,7 +595,7 @@ private fun PlaylistsAndFilterManagerScreen(
         ) {
             Text("Add IPTV Playlist Source", style = MaterialTheme.typography.headlineSmall, color = TextPrimary)
             Text(
-                "Step 1 fetches categories only. Step 2 lets you filter by Country & Sub-Category before importing.",
+                "Add multiple Stalker Portals, Xtream Codes accounts, or M3U playlists. Existing playlists stay saved and you can switch anytime.",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextMuted
             )
@@ -562,8 +649,8 @@ private fun PlaylistsAndFilterManagerScreen(
                 SourceType.STALKER -> {
                     TvTextField(
                         label = "Portal URL",
-                        value = portalUrl,
-                        onValueChange = { portalUrl = it },
+                        value = stalkerPortalUrl,
+                        onValueChange = { stalkerPortalUrl = it },
                         placeholder = "http://portal.example.com/c/ or /portal.php",
                         testTag = "stalker_portal_url_input"
                     )
@@ -615,8 +702,8 @@ private fun PlaylistsAndFilterManagerScreen(
                 SourceType.XTREAM -> {
                     TvTextField(
                         label = "Server URL",
-                        value = portalUrl,
-                        onValueChange = { portalUrl = it },
+                        value = xtreamServerUrl,
+                        onValueChange = { xtreamServerUrl = it },
                         placeholder = "http://server.example.com:8080",
                         testTag = "xtream_url_input"
                     )
@@ -702,14 +789,15 @@ private fun PlaylistsAndFilterManagerScreen(
                 icon = Icons.Default.AddCircle,
                 isPrimary = true,
                 onClick = {
+                    val activeUrl = if (sourceType == SourceType.STALKER) stalkerPortalUrl else xtreamServerUrl
                     val validationError = when (sourceType) {
                         SourceType.STALKER -> when {
-                            portalUrl.isBlank() -> "Enter a valid Stalker Portal URL."
+                            stalkerPortalUrl.isBlank() -> "Enter a valid Stalker Portal URL."
                             macAddress.trim().length < 11 -> "Enter a valid MAG MAC address (e.g. 00:1A:79:XX:XX:XX)."
                             else -> null
                         }
                         SourceType.XTREAM -> when {
-                            portalUrl.isBlank() || username.isBlank() || password.isBlank() ->
+                            xtreamServerUrl.isBlank() || username.isBlank() || password.isBlank() ->
                                 "Enter Server URL, Username, and Password."
                             else -> null
                         }
@@ -722,34 +810,39 @@ private fun PlaylistsAndFilterManagerScreen(
                         return@TvActionButton
                     }
                     formError = null
-                    val finalName = name.trim().ifBlank { "${sourceType.displayName} Playlist" }
+                    val finalName = name.trim().ifBlank {
+                        val sameTypeCount = playlists.count { it.type == sourceType }
+                        if (sameTypeCount == 0) sourceType.displayName else "${sourceType.displayName} #${sameTypeCount + 1}"
+                    }
                     onFetchAndFilter(
                         PlaylistSource(
                             name = finalName,
                             type = sourceType,
-                            portalUrl = portalUrl.trim(),
-                            macAddress = macAddress.trim().uppercase(),
-                            serialNumber = serialNumber.trim(),
-                            deviceId1 = deviceId1.trim(),
-                            deviceId2 = deviceId2.trim(),
-                            signature = signature.trim(),
-                            username = username.trim(),
-                            password = password.trim(),
+                            portalUrl = activeUrl.trim(),
+                            macAddress = if (sourceType == SourceType.STALKER) macAddress.trim().uppercase() else "",
+                            serialNumber = if (sourceType == SourceType.STALKER) serialNumber.trim() else "",
+                            deviceId1 = if (sourceType == SourceType.STALKER) deviceId1.trim() else "",
+                            deviceId2 = if (sourceType == SourceType.STALKER) deviceId2.trim() else "",
+                            signature = if (sourceType == SourceType.STALKER) signature.trim() else "",
+                            username = if (sourceType == SourceType.XTREAM) username.trim() else "",
+                            password = if (sourceType == SourceType.XTREAM) password.trim() else "",
                             m3uUrl = m3uUrl.trim(),
                             localFileUri = localFileUri.trim(),
                             epgUrl = epgUrl.trim()
                         )
                     )
+                    // Reset name field for adding the next playlist cleanly
+                    name = ""
                 },
                 modifier = Modifier.fillMaxWidth(),
                 testTag = "playlist_fetch_categories_button"
             )
         }
 
-        // Right Column (44%): Configured Playlists + Reopen Filter Controls
+        // Right Column (46%): Configured Playlists + Instant Switcher + Filter Controls
         Column(
             modifier = Modifier
-                .weight(0.44f)
+                .weight(0.46f)
                 .fillMaxHeight()
                 .clip(RoundedCornerShape(16.dp))
                 .background(ObsidianBase)
@@ -761,8 +854,23 @@ private fun PlaylistsAndFilterManagerScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("Configured Playlists", style = MaterialTheme.typography.headlineSmall, color = TextPrimary)
-                TvBadge(text = "${playlists.size}")
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text("Saved Playlists", style = MaterialTheme.typography.headlineSmall, color = TextPrimary)
+                    TvBadge(text = "${playlists.size}")
+                }
+                if (playlists.size > 1) {
+                    val isAllMode = activePlaylistId == null
+                    TvActionButton(
+                        text = if (isAllMode) "All Active" else "Show All",
+                        icon = Icons.Default.Layers,
+                        isPrimary = isAllMode,
+                        onClick = { onSelectActivePlaylist(null) },
+                        testTag = "playlist_show_all_button"
+                    )
+                }
             }
             Spacer(Modifier.height(12.dp))
 
@@ -784,13 +892,19 @@ private fun PlaylistsAndFilterManagerScreen(
                     items(playlists, key = { it.id }) { source ->
                         val cats = allCategories.filter { it.sourceId == source.id }
                         val checkedCount = cats.count { it.isSelected }
+                        val sourceItemsCount = mediaItems.count { it.sourceId == source.id }
+                        val isCurrentlyActive = activePlaylistId == source.id || (playlists.size == 1)
 
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(12.dp))
-                                .background(MidnightPanel)
-                                .border(1.dp, DividerSlate, RoundedCornerShape(12.dp))
+                                .background(if (isCurrentlyActive) BroadcastCyanDeep.copy(alpha = 0.16f) else MidnightPanel)
+                                .border(
+                                    width = if (isCurrentlyActive) 1.5.dp else 1.dp,
+                                    color = if (isCurrentlyActive) BroadcastCyan else DividerSlate,
+                                    shape = RoundedCornerShape(12.dp)
+                                )
                                 .padding(14.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
@@ -800,17 +914,33 @@ private fun PlaylistsAndFilterManagerScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Text(
+                                            text = source.name,
+                                            style = MaterialTheme.typography.titleMedium,
+                                            color = TextPrimary,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f, fill = false)
+                                        )
+                                        if (isCurrentlyActive) {
+                                            TvBadge(
+                                                text = "ACTIVE",
+                                                containerColor = ConnectedEmerald.copy(alpha = 0.22f),
+                                                contentColor = ConnectedEmerald
+                                            )
+                                        }
+                                    }
                                     Text(
-                                        text = source.name,
-                                        style = MaterialTheme.typography.titleMedium,
-                                        color = TextPrimary,
+                                        text = "${source.type.displayName} • $sourceItemsCount items • $checkedCount/${cats.size} groups",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = BroadcastCyan,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
-                                    )
-                                    Text(
-                                        text = "${source.type.displayName} • $checkedCount/${cats.size} categories selected",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = BroadcastCyan
                                     )
                                 }
                             }
@@ -819,15 +949,21 @@ private fun PlaylistsAndFilterManagerScreen(
                                 modifier = Modifier.fillMaxWidth()
                             ) {
                                 TvActionButton(
+                                    text = if (isCurrentlyActive) "Watch" else "Switch",
+                                    icon = if (isCurrentlyActive) Icons.Default.CheckCircle else Icons.Default.SwapHoriz,
+                                    isPrimary = !isCurrentlyActive,
+                                    onClick = { onSelectActivePlaylist(source.id) },
+                                    modifier = Modifier.weight(1f),
+                                    testTag = "playlist_switch_${source.id}"
+                                )
+                                TvActionButton(
                                     text = "Filter",
                                     icon = Icons.Default.FilterList,
-                                    isPrimary = true,
                                     onClick = { onOpenSavedFilter(source) },
-                                    modifier = Modifier.weight(1f),
                                     testTag = "playlist_edit_filter_${source.id}"
                                 )
                                 TvActionButton(
-                                    text = "Sync",
+                                    text = "",
                                     icon = Icons.Default.Refresh,
                                     onClick = { onRefreshServerCategories(source) },
                                     testTag = "playlist_sync_${source.id}"
@@ -1295,6 +1431,213 @@ private fun GlobalBusyAndStatusOverlay(
                         style = MaterialTheme.typography.titleMedium,
                         color = TextPrimary
                     )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * TV D-Pad Playlist Switcher Modal:
+ * Lets the user switch cleanly between any saved Xtream Codes, Stalker Portal, M3U,
+ * or Gist playlist, or select "All Playlists (Combined)".
+ */
+@Composable
+private fun PlaylistSwitcherOverlay(
+    playlists: List<PlaylistSource>,
+    activePlaylistId: String?,
+    mediaItems: List<MediaItem>,
+    onSelectPlaylist: (String?) -> Unit,
+    onClose: () -> Unit
+) {
+    BackHandler { onClose() }
+    val activeItemFocus = remember { FocusRequester() }
+
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(60L)
+        runCatching { activeItemFocus.requestFocus() }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(ObsidianVoid.copy(alpha = 0.80f)),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier
+                .width(560.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(ObsidianBase)
+                .border(1.5.dp, BroadcastCyan.copy(alpha = 0.65f), RoundedCornerShape(16.dp))
+                .padding(24.dp)
+                .testTag("playlist_switcher_modal"),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.SwapHoriz,
+                        contentDescription = "Switch Playlist",
+                        tint = BroadcastCyan,
+                        modifier = Modifier.size(26.dp)
+                    )
+                    Column {
+                        Text(
+                            text = "Switch IPTV Playlist",
+                            style = MaterialTheme.typography.headlineSmall,
+                            color = TextPrimary
+                        )
+                        Text(
+                            text = "Choose Xtream, Stalker, or view All Playlists combined",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextMuted
+                        )
+                    }
+                }
+                TvActionButton(
+                    text = "Close",
+                    onClick = onClose,
+                    testTag = "playlist_switcher_close"
+                )
+            }
+
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                items(playlists, key = { it.id }) { source ->
+                    val isSelected = activePlaylistId == source.id
+                    val liveCount = mediaItems.count { it.sourceId == source.id && it.type == ContentType.LIVE }
+                    val vodCount = mediaItems.count { it.sourceId == source.id && it.type == ContentType.VOD }
+                    val seriesCount = mediaItems.count { it.sourceId == source.id && it.type == ContentType.SERIES }
+
+                    TvFocusableSurface(
+                        onClick = { onSelectPlaylist(source.id) },
+                        selected = isSelected,
+                        focusScale = 1.02f,
+                        shape = RoundedCornerShape(10.dp),
+                        containerColor = MidnightPanel,
+                        selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.36f),
+                        focusedContainerColor = HighlightSlate,
+                        borderColor = if (isSelected) BroadcastCyan else DividerSlate.copy(alpha = 0.4f),
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(if (isSelected) Modifier.focusRequester(activeItemFocus) else Modifier)
+                            .testTag("switcher_option_${source.id}")
+                    ) { isFocused ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text(
+                                        text = source.name,
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = TextPrimary,
+                                        fontWeight = if (isSelected || isFocused) FontWeight.Bold else FontWeight.SemiBold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    TvBadge(
+                                        text = when (source.type) {
+                                            SourceType.STALKER -> "STALKER"
+                                            SourceType.XTREAM -> "XTREAM"
+                                            SourceType.M3U_URL -> "M3U"
+                                            SourceType.M3U_FILE -> "FILE"
+                                            SourceType.GIST_JSON -> "GIST"
+                                        }
+                                    )
+                                }
+                                Spacer(Modifier.height(2.dp))
+                                Text(
+                                    text = "$liveCount Live • $vodCount Movies • $seriesCount Series",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (isFocused) TextSecondary else TextMuted
+                                )
+                            }
+                            if (isSelected) {
+                                Icon(
+                                    imageVector = Icons.Default.CheckCircle,
+                                    contentDescription = "Active playlist",
+                                    tint = ConnectedEmerald,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                item(key = "switcher_all_playlists") {
+                    val isAllSelected = activePlaylistId == null
+                    TvFocusableSurface(
+                        onClick = { onSelectPlaylist(null) },
+                        selected = isAllSelected,
+                        focusScale = 1.02f,
+                        shape = RoundedCornerShape(10.dp),
+                        containerColor = MidnightPanel,
+                        selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.36f),
+                        focusedContainerColor = HighlightSlate,
+                        borderColor = if (isAllSelected) BroadcastCyan else DividerSlate.copy(alpha = 0.4f),
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(if (isAllSelected) Modifier.focusRequester(activeItemFocus) else Modifier)
+                            .testTag("switcher_option_all")
+                    ) { isFocused ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Layers,
+                                    contentDescription = "All playlists",
+                                    tint = BroadcastCyan,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                                Column {
+                                    Text(
+                                        text = "All Playlists Combined (${playlists.size})",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = TextPrimary,
+                                        fontWeight = if (isAllSelected || isFocused) FontWeight.Bold else FontWeight.SemiBold
+                                    )
+                                    Text(
+                                        text = "${mediaItems.size} total imported items across all sources",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = if (isFocused) TextSecondary else TextMuted
+                                    )
+                                }
+                            }
+                            if (isAllSelected) {
+                                Icon(
+                                    imageVector = Icons.Default.CheckCircle,
+                                    contentDescription = "All active",
+                                    tint = ConnectedEmerald,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

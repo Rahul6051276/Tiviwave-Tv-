@@ -27,6 +27,8 @@ import kotlinx.coroutines.launch
 data class IptvUiState(
     val currentSection: TvSection = TvSection.LIVE_TV,
     val playlists: List<PlaylistSource> = emptyList(),
+    /** Null means "All Playlists (Combined)" when multiple playlists exist; otherwise specific playlist ID. */
+    val activePlaylistId: String? = null,
     val selectedCategories: List<ContentCategory> = emptyList(),
     val allCategories: List<ContentCategory> = emptyList(),
     val mediaItems: List<MediaItem> = emptyList(),
@@ -66,7 +68,32 @@ data class IptvUiState(
     val errorMessage: String? = null,
     val testingNodeId: String? = null,
     val nodeLatencyResults: Map<String, String> = emptyMap()
-)
+) {
+    val activePlaylist: PlaylistSource?
+        get() = activePlaylistId?.let { id -> playlists.firstOrNull { it.id == id } }
+
+    val activePlaylistLabel: String
+        get() = when {
+            playlists.isEmpty() -> "No Playlist"
+            activePlaylist != null -> activePlaylist!!.name
+            playlists.size > 1 -> "All Playlists (${playlists.size})"
+            else -> playlists.first().name
+        }
+
+    val visibleSelectedCategories: List<ContentCategory>
+        get() = if (activePlaylistId == null) {
+            selectedCategories
+        } else {
+            selectedCategories.filter { it.sourceId == activePlaylistId }
+        }
+
+    val visibleMediaItems: List<MediaItem>
+        get() = if (activePlaylistId == null) {
+            mediaItems
+        } else {
+            mediaItems.filter { it.sourceId == activePlaylistId }
+        }
+}
 
 class IptvViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -96,8 +123,28 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
                 DataSnapshot(playlists, selectedCats, allCats, items, nodes)
             }.collect { snap ->
                 _uiState.update { state ->
+                    val derivedActiveId: String? = when {
+                        snap.playlists.isEmpty() -> null
+                        snap.playlists.size == 1 -> snap.playlists.first().id
+                        else -> {
+                            val activeEntries = snap.playlists.filter { it.isActive }
+                            when {
+                                activeEntries.size == 1 -> activeEntries.first().id
+                                activeEntries.size == snap.playlists.size -> null // Combined All Playlists mode
+                                activeEntries.isNotEmpty() -> activeEntries.first().id
+                                else -> snap.playlists.first().id
+                            }
+                        }
+                    }
+
+                    val visibleItems = if (derivedActiveId == null) {
+                        snap.items
+                    } else {
+                        snap.items.filter { it.sourceId == derivedActiveId }
+                    }
+
                     val refreshedPreview = state.previewChannel?.let { prev ->
-                        snap.items.firstOrNull { it.id == prev.id } ?: prev
+                        visibleItems.firstOrNull { it.id == prev.id }
                     }
                     val refreshedDetail = state.detailItem?.let { det ->
                         snap.items.firstOrNull { it.id == det.id } ?: det
@@ -107,11 +154,13 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     state.copy(
                         playlists = snap.playlists,
+                        activePlaylistId = derivedActiveId,
                         selectedCategories = snap.selectedCats,
                         allCategories = snap.allCats,
                         mediaItems = snap.items,
                         routingNodes = snap.nodes,
                         previewChannel = refreshedPreview,
+                        previewStream = if (refreshedPreview == null) null else state.previewStream,
                         detailItem = refreshedDetail,
                         playerItem = refreshedPlayer
                     )
@@ -302,10 +351,13 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
                         isFilterScreenOpen = false,
                         filterSource = null,
                         filterDraftCategories = emptyList(),
+                        activePlaylistId = source.id,
                         currentSection = targetSection,
                         selectedLiveCategoryId = "ALL",
                         selectedVodCategoryId = "ALL",
                         selectedSeriesCategoryId = "ALL",
+                        previewChannel = null,
+                        previewStream = null,
                         bannerMessage = null
                     )
                 }
@@ -318,6 +370,45 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
                         errorMessage = err.message ?: "Import failed"
                     )
                 }
+            }
+        }
+    }
+
+    /**
+     * Instantly switches between saved playlists (e.g. Xtream Codes <-> Stalker Portal <-> All Playlists)
+     * without deleting or modifying any saved playlists.
+     */
+    fun selectActivePlaylist(sourceId: String?, navigateToContent: Boolean = false) {
+        previewJob?.cancel()
+        viewModelScope.launch {
+            repository.setActivePlaylist(sourceId)
+            val currentState = _uiState.value
+            val targetItems = if (sourceId == null) {
+                currentState.mediaItems
+            } else {
+                currentState.mediaItems.filter { it.sourceId == sourceId }
+            }
+            val nextSection = if (navigateToContent && currentState.currentSection == TvSection.PLAYLISTS) {
+                when {
+                    targetItems.any { it.type == ContentType.LIVE } -> TvSection.LIVE_TV
+                    targetItems.any { it.type == ContentType.VOD } -> TvSection.MOVIES
+                    targetItems.any { it.type == ContentType.SERIES } -> TvSection.WEB_SERIES
+                    else -> TvSection.LIVE_TV
+                }
+            } else {
+                currentState.currentSection
+            }
+            _uiState.update { state ->
+                state.copy(
+                    activePlaylistId = sourceId,
+                    currentSection = nextSection,
+                    selectedLiveCategoryId = "ALL",
+                    selectedVodCategoryId = "ALL",
+                    selectedSeriesCategoryId = "ALL",
+                    previewChannel = null,
+                    previewStream = null,
+                    detailItem = null
+                )
             }
         }
     }
@@ -465,7 +556,7 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         val queue = if (item.type == ContentType.LIVE) {
             liveQueue.ifEmpty {
-                _uiState.value.mediaItems.filter { it.type == ContentType.LIVE }
+                _uiState.value.visibleMediaItems.filter { it.type == ContentType.LIVE }
             }
         } else {
             emptyList()
