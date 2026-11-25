@@ -17,12 +17,33 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 
 class XtreamAndM3uService(private val context: Context) {
 
     // Temporary in-memory parse cache for M3U / Gist sources between Step 1 (Categories) and Step 2 (Import)
     private val parsedItemBuffer = ConcurrentHashMap<String, List<MediaItem>>()
+
+    // Temporary in-memory cache for Xtream fallback streams (keyed by "sourceId:CONTENT_TYPE")
+    // populated when `get_*_categories` returns empty and categories are derived directly from streams.
+    private val xtreamFallbackBuffer = ConcurrentHashMap<String, List<MediaItem>>()
+
+    private data class XtreamAccountInfo(
+        val status: String,
+        val expDateFormatted: String
+    )
+
+    private data class XtreamCategorySpec(
+        val categoryAction: String,
+        val streamAction: String,
+        val contentType: ContentType,
+        val defaultCategoryId: String,
+        val defaultCategoryName: String
+    )
 
     /**
      * Step 1 Metadata-Only Fetch for Xtream Codes, M3U URL, Local M3U File, and GitHub Gist JSON.
@@ -58,14 +79,40 @@ class XtreamAndM3uService(private val context: Context) {
     // XTREAM CODES API
     // -------------------------------------------------------------------------
 
-    private fun normalizeBaseUrl(url: String): String {
-        var clean = url.trim().trimEnd('/')
+    /**
+     * Cleanly normalizes Xtream host/URL by ensuring scheme, removing query strings/fragments,
+     * and stripping trailing slashes as well as `/player_api.php`, `/get.php`, `/index.php`,
+     * `/panel_api.php`, or `/xmltv.php`.
+     */
+    fun normalizeBaseUrl(url: String): String {
+        var clean = url.trim()
+        if (clean.isBlank()) return ""
         if (!clean.startsWith("http://", ignoreCase = true) &&
             !clean.startsWith("https://", ignoreCase = true)
         ) {
             clean = "http://$clean"
         }
-        return clean.removeSuffix("/player_api.php")
+        clean = clean.substringBefore('#').substringBefore('?').trim()
+
+        val suffixes = listOf(
+            "/player_api.php",
+            "/get.php",
+            "/index.php",
+            "/panel_api.php",
+            "/xmltv.php"
+        )
+        var changed = true
+        while (changed) {
+            changed = false
+            clean = clean.trimEnd('/')
+            for (suffix in suffixes) {
+                if (clean.endsWith(suffix, ignoreCase = true)) {
+                    clean = clean.dropLast(suffix.length).trimEnd('/')
+                    changed = true
+                }
+            }
+        }
+        return clean.trimEnd('/')
     }
 
     private fun extractOrigin(baseUrl: String): String {
@@ -99,16 +146,31 @@ class XtreamAndM3uService(private val context: Context) {
 
     fun buildXtreamXmltvUrl(source: PlaylistSource): String {
         val base = normalizeBaseUrl(source.portalUrl)
-        return "$base/xmltv.php?username=${source.username}&password=${source.password}"
+        return "$base/xmltv.php?username=${source.username.trim()}&password=${source.password.trim()}"
     }
 
-    private fun executeXtreamApi(source: PlaylistSource, action: String, extra: Map<String, String> = emptyMap()): String {
+    private fun executeXtreamApi(
+        source: PlaylistSource,
+        action: String? = null,
+        extra: Map<String, String> = emptyMap()
+    ): String {
         val base = normalizeBaseUrl(source.portalUrl)
+        if (base.isBlank()) {
+            error("Xtream Host URL is required.")
+        }
+        val user = source.username.trim()
+        val pass = source.password.trim()
+        if (user.isBlank() || pass.isBlank()) {
+            error("Xtream username and password are required.")
+        }
+
         val urlBuilder = "$base/player_api.php".toHttpUrlOrNull()?.newBuilder()
             ?: error("Invalid Xtream portal URL: $base")
-        urlBuilder.addQueryParameter("username", source.username.trim())
-        urlBuilder.addQueryParameter("password", source.password.trim())
-        urlBuilder.addQueryParameter("action", action)
+        urlBuilder.addQueryParameter("username", user)
+        urlBuilder.addQueryParameter("password", pass)
+        if (!action.isNullOrBlank()) {
+            urlBuilder.addQueryParameter("action", action)
+        }
         extra.forEach { (k, v) -> urlBuilder.addQueryParameter(k, v) }
 
         val client = RoutingManager.buildHttpClient(
@@ -118,46 +180,283 @@ class XtreamAndM3uService(private val context: Context) {
         val request = Request.Builder()
             .url(urlBuilder.build())
             .header("User-Agent", "TiviWaveTV/1.0 (AndroidTV)")
+            .header("Accept", "application/json, */*")
             .get()
             .build()
 
         client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("Xtream API HTTP ${response.code}")
-            return response.body?.string().orEmpty()
+            val body = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                val reason = when (response.code) {
+                    401, 403 -> "invalid credentials or access blocked"
+                    404 -> "player_api.php not found at $base"
+                    in 500..599 -> "Xtream server error"
+                    else -> "HTTP error"
+                }
+                error("Xtream API HTTP ${response.code} ($reason)")
+            }
+            return body
+        }
+    }
+
+    /**
+     * Calls base `player_api.php` (without `action`) and inspects `user_info` (`auth`, `status`, `exp_date`)
+     * to provide accurate, actionable error messages when credentials, account status, or URL fail.
+     */
+    private fun validateXtreamAccount(source: PlaylistSource): XtreamAccountInfo {
+        val base = normalizeBaseUrl(source.portalUrl)
+        val raw = executeXtreamApi(source, action = null).trim()
+        if (raw.isEmpty()) {
+            error("Xtream server at $base returned an empty response. Check Host URL or proxy settings.")
+        }
+        if (raw.startsWith("<")) {
+            error("Server at $base returned an HTML page instead of Xtream API JSON. Verify the Host URL.")
+        }
+
+        val root = runCatching { JSONObject(raw) }.getOrNull()
+            ?: error("Server at $base returned an invalid Xtream JSON response. Verify the Host URL.")
+
+        val userInfo = root.optJSONObject("user_info")
+            ?: return XtreamAccountInfo(status = "Active", expDateFormatted = "")
+
+        val authRaw = userInfo.opt("auth")
+        val isAuthFailed = when (authRaw) {
+            is Number -> authRaw.toInt() == 0
+            is Boolean -> !authRaw
+            is String -> authRaw.trim() == "0" || authRaw.trim().equals("false", ignoreCase = true)
+            else -> false
+        }
+        if (isAuthFailed) {
+            val serverMsg = userInfo.optCleanString("message")
+            val detail = if (serverMsg.isNotBlank()) " ($serverMsg)" else ""
+            error("Xtream login failed: invalid username or password$detail.")
+        }
+
+        val expRaw = userInfo.optCleanString("exp_date")
+        val expSec = expRaw.toLongOrNull() ?: 0L
+        val formattedExp = if (expSec > 0L) formatUnixDate(expSec) else ""
+
+        val status = userInfo.optCleanString("status")
+        if (status.isNotBlank() &&
+            !status.equals("Active", ignoreCase = true) &&
+            !status.equals("Trial", ignoreCase = true)
+        ) {
+            val expSuffix = if (formattedExp.isNotBlank()) " (exp: $formattedExp)" else ""
+            error("Xtream account status is '$status'$expSuffix. Check subscription with your provider.")
+        }
+
+        if (expSec > 0L && expSec * 1000L < System.currentTimeMillis()) {
+            error("Xtream account expired on $formattedExp. Renew your subscription or update credentials.")
+        }
+
+        return XtreamAccountInfo(
+            status = status.ifBlank { "Active" },
+            expDateFormatted = formattedExp
+        )
+    }
+
+    private fun clearXtreamFallbackBuffer(sourceId: String) {
+        ContentType.entries.forEach { type ->
+            xtreamFallbackBuffer.remove("${sourceId}:${type.name}")
         }
     }
 
     private suspend fun fetchXtreamCategories(source: PlaylistSource): List<ContentCategory> = withContext(Dispatchers.IO) {
+        val accountInfo = validateXtreamAccount(source)
+        clearXtreamFallbackBuffer(source.id)
+
+        val base = normalizeBaseUrl(source.portalUrl)
+        val user = source.username.trim()
+        val pass = source.password.trim()
         val categories = mutableListOf<ContentCategory>()
+        var lastApiError: String? = null
 
         val specs = listOf(
-            "get_live_categories" to ContentType.LIVE,
-            "get_vod_categories" to ContentType.VOD,
-            "get_series_categories" to ContentType.SERIES
+            XtreamCategorySpec(
+                categoryAction = "get_live_categories",
+                streamAction = "get_live_streams",
+                contentType = ContentType.LIVE,
+                defaultCategoryId = "live_all",
+                defaultCategoryName = "All Live Channels"
+            ),
+            XtreamCategorySpec(
+                categoryAction = "get_vod_categories",
+                streamAction = "get_vod_streams",
+                contentType = ContentType.VOD,
+                defaultCategoryId = "vod_all",
+                defaultCategoryName = "All Movies"
+            ),
+            XtreamCategorySpec(
+                categoryAction = "get_series_categories",
+                streamAction = "get_series",
+                contentType = ContentType.SERIES,
+                defaultCategoryId = "series_all",
+                defaultCategoryName = "All Series"
+            )
         )
 
-        for ((action, contentType) in specs) {
-            runCatching {
-                val raw = executeXtreamApi(source, action).trim()
-                if (!raw.startsWith("[")) return@runCatching
-                val array = JSONArray(raw)
-                for (i in 0 until array.length()) {
-                    val obj = array.optJSONObject(i) ?: continue
-                    val catId = obj.optCleanString("category_id")
-                    val catName = obj.optCleanString("category_name")
-                    if (catId.isBlank() || catName.isBlank()) continue
-                    categories += ContentCategory(
-                        id = "${contentType.name.lowercase()}_$catId",
-                        sourceId = source.id,
-                        name = catName,
-                        countryGroup = CountryCategoryClassifier.classifyCountryGroup(catName),
-                        type = contentType,
-                        isSelected = false
+        for (spec in specs) {
+            var typeCategories = emptyList<ContentCategory>()
+
+            val catRaw = runCatching {
+                executeXtreamApi(source, spec.categoryAction)
+            }.onFailure { err ->
+                if (lastApiError.isNullOrBlank()) lastApiError = err.message
+            }.getOrNull()
+
+            if (!catRaw.isNullOrBlank()) {
+                typeCategories = parseXtreamCategoriesJson(catRaw, source.id, spec.contentType)
+            }
+
+            // Fallback: If get_*_categories returned empty [], fetch corresponding streams
+            // and derive categories automatically from unique category_id + category_name
+            // (or a default category if missing).
+            if (typeCategories.isEmpty()) {
+                val streamsRaw = runCatching {
+                    executeXtreamApi(source, spec.streamAction)
+                }.onFailure { err ->
+                    if (lastApiError.isNullOrBlank()) lastApiError = err.message
+                }.getOrNull()
+
+                if (!streamsRaw.isNullOrBlank()) {
+                    typeCategories = buildXtreamCategoriesFromStreams(
+                        rawJson = streamsRaw,
+                        source = source,
+                        base = base,
+                        user = user,
+                        pass = pass,
+                        spec = spec
                     )
                 }
             }
+
+            categories += typeCategories
         }
-        categories.distinctBy { "${it.type.name}:${it.id}" }
+
+        val deduped = categories.distinctBy { "${it.type.name}:${it.id}" }
+        if (deduped.isEmpty()) {
+            val detail = lastApiError ?: buildString {
+                append("Xtream account authenticated (Status: ${accountInfo.status}")
+                if (accountInfo.expDateFormatted.isNotBlank()) {
+                    append(", Exp: ${accountInfo.expDateFormatted}")
+                }
+                append("), but the server returned 0 Live, VOD, and Series categories or streams.")
+            }
+            error(detail)
+        }
+        deduped
+    }
+
+    private fun parseXtreamCategoriesJson(
+        rawBody: String,
+        sourceId: String,
+        contentType: ContentType
+    ): List<ContentCategory> {
+        val objects = extractJsonObjectList(rawBody)
+        if (objects.isEmpty()) return emptyList()
+
+        val result = mutableListOf<ContentCategory>()
+        val seenIds = mutableSetOf<String>()
+        for (obj in objects) {
+            val catId = obj.optCleanString("category_id").ifBlank { obj.optCleanString("id") }
+            val catName = obj.optCleanString("category_name")
+                .ifBlank { obj.optCleanString("name") }
+                .ifBlank { obj.optCleanString("title") }
+            if (catId.isBlank() || catName.isBlank()) continue
+
+            val compositeId = "${contentType.name.lowercase()}_$catId"
+            if (seenIds.add(compositeId)) {
+                result += ContentCategory(
+                    id = compositeId,
+                    sourceId = sourceId,
+                    name = catName,
+                    countryGroup = CountryCategoryClassifier.classifyCountryGroup(catName),
+                    type = contentType,
+                    isSelected = false
+                )
+            }
+        }
+        return result
+    }
+
+    private fun buildXtreamCategoriesFromStreams(
+        rawJson: String,
+        source: PlaylistSource,
+        base: String,
+        user: String,
+        pass: String,
+        spec: XtreamCategorySpec
+    ): List<ContentCategory> {
+        val objects = extractJsonObjectList(rawJson)
+        if (objects.isEmpty()) return emptyList()
+
+        val categoryMap = linkedMapOf<String, ContentCategory>()
+        val countMap = mutableMapOf<String, Int>()
+        val parsedItems = mutableListOf<MediaItem>()
+
+        for ((index, obj) in objects.withIndex()) {
+            val rawCatId = extractXtreamStreamCategoryId(obj)
+            val rawCatName = obj.optCleanString("category_name")
+                .ifBlank { obj.optCleanString("category_title") }
+                .ifBlank { obj.optCleanString("group_title") }
+
+            val hasRealId = rawCatId.isNotBlank() && rawCatId != "0"
+            val hasRealName = rawCatName.isNotBlank() && !rawCatName.equals("All", ignoreCase = true)
+
+            val (catId, catName) = when {
+                hasRealId -> {
+                    val labelPrefix = when (spec.contentType) {
+                        ContentType.LIVE -> "Live Group"
+                        ContentType.VOD -> "VOD Group"
+                        ContentType.SERIES -> "Series Group"
+                    }
+                    "${spec.contentType.name.lowercase()}_$rawCatId" to
+                        (if (hasRealName) rawCatName else "$labelPrefix $rawCatId")
+                }
+                hasRealName -> {
+                    val slug = rawCatName.lowercase(Locale.US)
+                        .replace(Regex("[^a-z0-9]+"), "_")
+                        .trim('_')
+                        .ifBlank { "all" }
+                    "${spec.contentType.name.lowercase()}_$slug" to rawCatName
+                }
+                else -> spec.defaultCategoryId to spec.defaultCategoryName
+            }
+
+            categoryMap.getOrPut(catId) {
+                ContentCategory(
+                    id = catId,
+                    sourceId = source.id,
+                    name = catName,
+                    countryGroup = CountryCategoryClassifier.classifyCountryGroup(catName),
+                    type = spec.contentType,
+                    isSelected = false
+                )
+            }
+
+            val item = parseXtreamStreamItem(
+                obj = obj,
+                index = index,
+                source = source,
+                base = base,
+                user = user,
+                pass = pass,
+                contentType = spec.contentType,
+                categoryId = catId
+            )
+            if (item != null) {
+                parsedItems += item
+                countMap[catId] = (countMap[catId] ?: 0) + 1
+            }
+        }
+
+        if (parsedItems.isEmpty()) return emptyList()
+
+        xtreamFallbackBuffer["${source.id}:${spec.contentType.name}"] = parsedItems.distinctBy { it.id }
+
+        return categoryMap.values.map { cat ->
+            cat.copy(itemCount = countMap[cat.id] ?: 0)
+        }
     }
 
     private suspend fun fetchXtreamItemsForCategories(
@@ -168,111 +467,78 @@ class XtreamAndM3uService(private val context: Context) {
         val user = source.username.trim()
         val pass = source.password.trim()
         val items = mutableListOf<MediaItem>()
+        val unfilteredTypeCache = mutableMapOf<ContentType, List<JSONObject>>()
 
         for (category in selectedCategories) {
             val rawCatId = category.id.substringAfter('_', category.id)
+            val isWildcard = rawCatId.equals("all", ignoreCase = true) || rawCatId == "*"
+
+            // Use Step-1 stream-fallback buffer immediately when available
+            val buffered = xtreamFallbackBuffer["${source.id}:${category.type.name}"].orEmpty()
+            if (buffered.isNotEmpty()) {
+                val matched = if (isWildcard) buffered else buffered.filter { it.categoryId == category.id }
+                if (matched.isNotEmpty()) {
+                    items += matched
+                    continue
+                }
+            }
+
             val action = when (category.type) {
                 ContentType.LIVE -> "get_live_streams"
                 ContentType.VOD -> "get_vod_streams"
                 ContentType.SERIES -> "get_series"
             }
 
+            val parsedForCategory = mutableListOf<MediaItem>()
             runCatching {
-                val raw = executeXtreamApi(source, action, mapOf("category_id" to rawCatId)).trim()
-                if (!raw.startsWith("[")) return@runCatching
-                val array = JSONArray(raw)
-                for (i in 0 until array.length()) {
-                    val obj = array.optJSONObject(i) ?: continue
-                    when (category.type) {
-                        ContentType.LIVE -> {
-                            val streamId = obj.optCleanString("stream_id")
-                            val name = obj.optCleanString("name")
-                            if (streamId.isBlank() || name.isBlank()) continue
-                            val iconUrl = resolveXtreamAssetUrl(base, obj.optCleanString("stream_icon"))
-                            items += MediaItem(
-                                id = "${source.id}_live_$streamId",
-                                sourceId = source.id,
-                                title = name,
-                                streamUrlOrCmd = "$base/live/$user/$pass/$streamId.ts",
-                                posterUrl = iconUrl,
-                                categoryId = category.id,
-                                type = ContentType.LIVE,
-                                epgChannelId = obj.optCleanString("epg_channel_id").ifBlank { streamId },
-                                channelNumber = obj.optInt("num", i + 1)
-                            )
-                        }
+                val extra = if (isWildcard) emptyMap() else mapOf("category_id" to rawCatId)
+                val raw = executeXtreamApi(source, action, extra)
+                val objects = extractJsonObjectList(raw)
+                for ((i, obj) in objects.withIndex()) {
+                    parseXtreamStreamItem(
+                        obj = obj,
+                        index = i,
+                        source = source,
+                        base = base,
+                        user = user,
+                        pass = pass,
+                        contentType = category.type,
+                        categoryId = category.id
+                    )?.let { parsedForCategory += it }
+                }
+            }
 
-                        ContentType.VOD -> {
-                            val streamId = obj.optCleanString("stream_id")
-                            val name = obj.optCleanString("name")
-                            val ext = obj.optCleanString("container_extension").ifBlank { "mp4" }
-                            if (streamId.isBlank() || name.isBlank()) continue
-                            val poster = resolveXtreamAssetUrl(
-                                base,
-                                obj.optCleanString("stream_icon").ifBlank { obj.optCleanString("cover") }
-                            )
-                            val addedAt = parseXtreamAddedMs(
-                                obj.optCleanString("added"),
-                                fallbackId = streamId.toLongOrNull() ?: i.toLong()
-                            )
-                            val rating = normalizeRating(
-                                obj.optCleanString("rating").ifBlank { obj.optCleanString("rating_5based") }
-                            )
-                            items += MediaItem(
-                                id = "${source.id}_vod_$streamId",
-                                sourceId = source.id,
-                                title = name,
-                                streamUrlOrCmd = "$base/movie/$user/$pass/$streamId.$ext",
-                                posterUrl = poster,
-                                backdropUrl = poster,
-                                categoryId = category.id,
-                                type = ContentType.VOD,
-                                rating = rating,
-                                year = obj.optCleanString("year").ifBlank { extractYearFromTitle(name) },
-                                plot = obj.optCleanString("plot"),
-                                addedAt = addedAt
-                            )
-                        }
-
-                        ContentType.SERIES -> {
-                            val seriesId = obj.optCleanString("series_id")
-                            val name = obj.optCleanString("name")
-                            if (seriesId.isBlank() || name.isBlank()) continue
-                            val rawBackdrop = obj.optJSONArray("backdrop_path")?.optString(0).orEmpty()
-                            val rawCover = obj.optCleanString("cover")
-                                .ifBlank { obj.optCleanString("stream_icon") }
-                                .ifBlank { obj.optCleanString("poster") }
-                                .ifBlank { rawBackdrop }
-                            val poster = resolveXtreamAssetUrl(base, rawCover)
-                            val backdrop = resolveXtreamAssetUrl(base, rawBackdrop.ifBlank { rawCover })
-                            val addedAt = parseXtreamAddedMs(
-                                obj.optCleanString("last_modified").ifBlank { obj.optCleanString("added") },
-                                fallbackId = seriesId.toLongOrNull() ?: i.toLong()
-                            )
-                            val rating = normalizeRating(
-                                obj.optCleanString("rating").ifBlank { obj.optCleanString("rating_5based") }
-                            )
-                            items += MediaItem(
-                                id = "${source.id}_series_$seriesId",
-                                sourceId = source.id,
-                                title = name,
-                                streamUrlOrCmd = "",
-                                posterUrl = poster,
-                                backdropUrl = backdrop,
-                                categoryId = category.id,
-                                type = ContentType.SERIES,
-                                rating = rating,
-                                plot = obj.optCleanString("plot"),
-                                year = obj.optCleanString("releaseDate").take(4)
-                                    .ifBlank { obj.optCleanString("year") }
-                                    .ifBlank { extractYearFromTitle(name) },
-                                seriesId = seriesId,
-                                addedAt = addedAt
-                            )
-                        }
+            // If category_id-filtered endpoint returned empty (common on panels that broke category filtering),
+            // fetch unfiltered streams once for this type and filter locally.
+            if (parsedForCategory.isEmpty() && !isWildcard) {
+                val allObjects = unfilteredTypeCache.getOrPut(category.type) {
+                    runCatching {
+                        extractJsonObjectList(executeXtreamApi(source, action))
+                    }.getOrDefault(emptyList())
+                }
+                for ((i, obj) in allObjects.withIndex()) {
+                    val objCatIds = extractAllXtreamStreamCategoryIds(obj)
+                    val objCatName = obj.optCleanString("category_name")
+                        .ifBlank { obj.optCleanString("category_title") }
+                        .ifBlank { obj.optCleanString("group_title") }
+                    val matchesCategory = rawCatId in objCatIds ||
+                        (objCatName.isNotBlank() && objCatName.equals(category.name, ignoreCase = true))
+                    if (matchesCategory) {
+                        parseXtreamStreamItem(
+                            obj = obj,
+                            index = i,
+                            source = source,
+                            base = base,
+                            user = user,
+                            pass = pass,
+                            contentType = category.type,
+                            categoryId = category.id
+                        )?.let { parsedForCategory += it }
                     }
                 }
             }
+
+            items += parsedForCategory
         }
 
         val deduped = items.distinctBy { "${it.type.name}:${it.id}" }
@@ -284,6 +550,157 @@ class XtreamAndM3uService(private val context: Context) {
                     .thenByDescending { it.id.substringAfterLast('_').filter(Char::isDigit).toLongOrNull() ?: 0L }
             )
         liveItems + vodAndSeries
+    }
+
+    private fun parseXtreamStreamItem(
+        obj: JSONObject,
+        index: Int,
+        source: PlaylistSource,
+        base: String,
+        user: String,
+        pass: String,
+        contentType: ContentType,
+        categoryId: String
+    ): MediaItem? {
+        return when (contentType) {
+            ContentType.LIVE -> {
+                val streamId = obj.optCleanString("stream_id").ifBlank { obj.optCleanString("id") }
+                val name = obj.optCleanString("name").ifBlank { obj.optCleanString("title") }
+                if (streamId.isBlank() || name.isBlank()) return null
+                val iconUrl = resolveXtreamAssetUrl(base, obj.optCleanString("stream_icon"))
+                MediaItem(
+                    id = "${source.id}_live_$streamId",
+                    sourceId = source.id,
+                    title = name,
+                    streamUrlOrCmd = "$base/live/$user/$pass/$streamId.ts",
+                    posterUrl = iconUrl,
+                    categoryId = categoryId,
+                    type = ContentType.LIVE,
+                    epgChannelId = obj.optCleanString("epg_channel_id").ifBlank { streamId },
+                    channelNumber = obj.optInt("num", index + 1)
+                )
+            }
+
+            ContentType.VOD -> {
+                val streamId = obj.optCleanString("stream_id").ifBlank { obj.optCleanString("id") }
+                val name = obj.optCleanString("name").ifBlank { obj.optCleanString("title") }
+                val ext = obj.optCleanString("container_extension").ifBlank { "mp4" }
+                if (streamId.isBlank() || name.isBlank()) return null
+                val poster = resolveXtreamAssetUrl(
+                    base,
+                    obj.optCleanString("stream_icon").ifBlank { obj.optCleanString("cover") }
+                )
+                val addedAt = parseXtreamAddedMs(
+                    obj.optCleanString("added"),
+                    fallbackId = streamId.toLongOrNull() ?: index.toLong()
+                )
+                val rating = normalizeRating(
+                    obj.optCleanString("rating").ifBlank { obj.optCleanString("rating_5based") }
+                )
+                MediaItem(
+                    id = "${source.id}_vod_$streamId",
+                    sourceId = source.id,
+                    title = name,
+                    streamUrlOrCmd = "$base/movie/$user/$pass/$streamId.$ext",
+                    posterUrl = poster,
+                    backdropUrl = poster,
+                    categoryId = categoryId,
+                    type = ContentType.VOD,
+                    rating = rating,
+                    year = obj.optCleanString("year").ifBlank { extractYearFromTitle(name) },
+                    plot = obj.optCleanString("plot"),
+                    addedAt = addedAt
+                )
+            }
+
+            ContentType.SERIES -> {
+                val seriesId = obj.optCleanString("series_id").ifBlank { obj.optCleanString("id") }
+                val name = obj.optCleanString("name").ifBlank { obj.optCleanString("title") }
+                if (seriesId.isBlank() || name.isBlank()) return null
+                val rawBackdrop = obj.optJSONArray("backdrop_path")?.optString(0).orEmpty()
+                val rawCover = obj.optCleanString("cover")
+                    .ifBlank { obj.optCleanString("stream_icon") }
+                    .ifBlank { obj.optCleanString("poster") }
+                    .ifBlank { rawBackdrop }
+                val poster = resolveXtreamAssetUrl(base, rawCover)
+                val backdrop = resolveXtreamAssetUrl(base, rawBackdrop.ifBlank { rawCover })
+                val addedAt = parseXtreamAddedMs(
+                    obj.optCleanString("last_modified").ifBlank { obj.optCleanString("added") },
+                    fallbackId = seriesId.toLongOrNull() ?: index.toLong()
+                )
+                val rating = normalizeRating(
+                    obj.optCleanString("rating").ifBlank { obj.optCleanString("rating_5based") }
+                )
+                MediaItem(
+                    id = "${source.id}_series_$seriesId",
+                    sourceId = source.id,
+                    title = name,
+                    streamUrlOrCmd = "",
+                    posterUrl = poster,
+                    backdropUrl = backdrop,
+                    categoryId = categoryId,
+                    type = ContentType.SERIES,
+                    rating = rating,
+                    plot = obj.optCleanString("plot"),
+                    year = obj.optCleanString("releaseDate").take(4)
+                        .ifBlank { obj.optCleanString("year") }
+                        .ifBlank { extractYearFromTitle(name) },
+                    seriesId = seriesId,
+                    addedAt = addedAt
+                )
+            }
+        }
+    }
+
+    private fun extractXtreamStreamCategoryId(obj: JSONObject): String {
+        val direct = obj.optCleanString("category_id")
+        if (direct.isNotBlank()) return direct
+        val catIds = obj.optJSONArray("category_ids")
+        if (catIds != null && catIds.length() > 0) {
+            val first = catIds.opt(0)?.toString()?.trim().orEmpty()
+            if (first.isNotBlank() && !first.equals("null", ignoreCase = true)) {
+                return first
+            }
+        }
+        return ""
+    }
+
+    private fun extractAllXtreamStreamCategoryIds(obj: JSONObject): Set<String> {
+        val ids = mutableSetOf<String>()
+        obj.optCleanString("category_id").takeIf { it.isNotBlank() }?.let { ids += it }
+        val catIds = obj.optJSONArray("category_ids")
+        if (catIds != null) {
+            for (i in 0 until catIds.length()) {
+                val v = catIds.opt(i)?.toString()?.trim().orEmpty()
+                if (v.isNotBlank() && !v.equals("null", ignoreCase = true)) {
+                    ids += v
+                }
+            }
+        }
+        return ids
+    }
+
+    private fun extractJsonObjectList(rawBody: String): List<JSONObject> {
+        val trimmed = rawBody.trim()
+        if (trimmed.isEmpty()) return emptyList()
+        val result = mutableListOf<JSONObject>()
+        if (trimmed.startsWith("[")) {
+            val array = runCatching { JSONArray(trimmed) }.getOrNull() ?: return emptyList()
+            for (i in 0 until array.length()) {
+                array.optJSONObject(i)?.let { result += it }
+            }
+            return result
+        }
+        if (trimmed.startsWith("{")) {
+            val obj = runCatching { JSONObject(trimmed) }.getOrNull() ?: return emptyList()
+            // Ignore authentication error payloads (`{"user_info": ...}`) when expecting lists
+            if (obj.has("user_info") && obj.length() <= 2) return emptyList()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                obj.optJSONObject(keys.next())?.let { result += it }
+            }
+        }
+        return result
     }
 
     suspend fun fetchXtreamSeriesSeasons(
@@ -650,6 +1067,15 @@ class XtreamAndM3uService(private val context: Context) {
             cat.copy(itemCount = categoryCounts[cat.id] ?: 0)
         }
         return finalizedCategories to items
+    }
+
+    private fun formatUnixDate(epochSeconds: Long): String {
+        return runCatching {
+            val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone("UTC")
+            }
+            sdf.format(Date(epochSeconds * 1000L))
+        }.getOrDefault("")
     }
 
     private fun parseXtreamAddedMs(raw: String, fallbackId: Long): Long {
