@@ -25,12 +25,25 @@ import java.util.concurrent.ConcurrentHashMap
 
 class XtreamAndM3uService(private val context: Context) {
 
-    // Temporary in-memory parse cache for M3U / Gist sources between Step 1 (Categories) and Step 2 (Import)
+    companion object {
+        private val XTREAM_USER_AGENTS = listOf(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "VLC/3.0.20 LibVLC/3.0.20",
+            "IPTVSmartersPro"
+        )
+        private const val XTREAM_CONNECT_TIMEOUT_SEC = 12L
+        private const val XTREAM_READ_TIMEOUT_SEC = 25L
+    }
+
+    // Temporary in-memory parse cache for M3U / Gist / Xtream get.php fallback between Step 1 and Step 2
     private val parsedItemBuffer = ConcurrentHashMap<String, List<MediaItem>>()
 
     // Temporary in-memory cache for Xtream fallback streams (keyed by "sourceId:CONTENT_TYPE")
-    // populated when `get_*_categories` returns empty and categories are derived directly from streams.
     private val xtreamFallbackBuffer = ConcurrentHashMap<String, List<MediaItem>>()
+
+    // Remembers winning base URL (HTTP vs HTTPS) and User-Agent per Xtream source
+    private val resolvedBaseCache = ConcurrentHashMap<String, String>()
+    private val resolvedUaCache = ConcurrentHashMap<String, String>()
 
     private data class XtreamAccountInfo(
         val status: String,
@@ -76,21 +89,22 @@ class XtreamAndM3uService(private val context: Context) {
     }
 
     // -------------------------------------------------------------------------
-    // XTREAM CODES API
+    // XTREAM CODES API (UNIVERSAL COMPATIBILITY)
     // -------------------------------------------------------------------------
 
     /**
-     * Cleanly normalizes Xtream host/URL by ensuring scheme, removing query strings/fragments,
-     * and stripping trailing slashes as well as `/player_api.php`, `/get.php`, `/index.php`,
-     * `/panel_api.php`, or `/xmltv.php`.
+     * Cleanly normalizes Xtream host/URL by handling `//host`, ensuring scheme,
+     * removing query strings/fragments, and stripping trailing slashes as well as
+     * `/player_api.php`, `/get.php`, `/index.php`, `/panel_api.php`, or `/xmltv.php`.
      */
     fun normalizeBaseUrl(url: String): String {
         var clean = url.trim()
         if (clean.isBlank()) return ""
-        if (!clean.startsWith("http://", ignoreCase = true) &&
-            !clean.startsWith("https://", ignoreCase = true)
-        ) {
-            clean = "http://$clean"
+        clean = when {
+            clean.startsWith("http://", ignoreCase = true) ||
+                clean.startsWith("https://", ignoreCase = true) -> clean
+            clean.startsWith("//") -> "http:$clean"
+            else -> "http://${clean.trimStart('/')}"
         }
         clean = clean.substringBefore('#').substringBefore('?').trim()
 
@@ -113,6 +127,14 @@ class XtreamAndM3uService(private val context: Context) {
             }
         }
         return clean.trimEnd('/')
+    }
+
+    private fun swapScheme(url: String): String? {
+        return when {
+            url.startsWith("http://", ignoreCase = true) -> "https://${url.substring(7)}"
+            url.startsWith("https://", ignoreCase = true) -> "http://${url.substring(8)}"
+            else -> null
+        }
     }
 
     private fun extractOrigin(baseUrl: String): String {
@@ -145,17 +167,27 @@ class XtreamAndM3uService(private val context: Context) {
     }
 
     fun buildXtreamXmltvUrl(source: PlaylistSource): String {
-        val base = normalizeBaseUrl(source.portalUrl)
+        val base = resolvedBaseCache[source.id] ?: normalizeBaseUrl(source.portalUrl)
         return "$base/xmltv.php?username=${source.username.trim()}&password=${source.password.trim()}"
     }
 
+    private fun activeXtreamHeaders(source: PlaylistSource): Map<String, String> {
+        val ua = resolvedUaCache[source.id] ?: XTREAM_USER_AGENTS.first()
+        return mapOf("User-Agent" to ua)
+    }
+
+    /**
+     * Executes an Xtream `player_api.php` call with automatic HTTP/HTTPS scheme fallback
+     * and multi-User-Agent fallback (Chrome -> VLC -> IPTVSmartersPro) so strict panels
+     * and reverse proxies never fail unnecessarily.
+     */
     private fun executeXtreamApi(
         source: PlaylistSource,
         action: String? = null,
         extra: Map<String, String> = emptyMap()
     ): String {
-        val base = normalizeBaseUrl(source.portalUrl)
-        if (base.isBlank()) {
+        val primaryBase = resolvedBaseCache[source.id] ?: normalizeBaseUrl(source.portalUrl)
+        if (primaryBase.isBlank()) {
             error("Xtream Host URL is required.")
         }
         val user = source.username.trim()
@@ -164,6 +196,60 @@ class XtreamAndM3uService(private val context: Context) {
             error("Xtream username and password are required.")
         }
 
+        val candidateBases = buildList {
+            add(primaryBase)
+            swapScheme(primaryBase)?.let { alt ->
+                if (!alt.equals(primaryBase, ignoreCase = true)) add(alt)
+            }
+        }
+        val cachedUa = resolvedUaCache[source.id]
+        val candidateUas = buildList {
+            if (!cachedUa.isNullOrBlank()) add(cachedUa)
+            XTREAM_USER_AGENTS.forEach { if (it != cachedUa) add(it) }
+        }
+
+        var lastError: Exception? = null
+        for (base in candidateBases) {
+            for (ua in candidateUas) {
+                try {
+                    val body = executeSingleXtreamRequest(
+                        base = base,
+                        user = user,
+                        pass = pass,
+                        action = action,
+                        extra = extra,
+                        userAgent = ua
+                    )
+                    val trimmed = body.trim()
+                    if (trimmed.isNotEmpty() && !trimmed.startsWith("<")) {
+                        resolvedBaseCache[source.id] = base
+                        resolvedUaCache[source.id] = ua
+                        return body
+                    }
+                    // If HTML page came back, try next User-Agent / scheme before giving up
+                    lastError = IllegalStateException(
+                        "Server at $base returned an HTML page instead of Xtream API JSON."
+                    )
+                } catch (e: Exception) {
+                    lastError = e
+                    // On non-403/401 connection errors, don't burn retries on alternate UAs for the same unreachable base
+                    val msg = e.message.orEmpty()
+                    val isUaRecoverable = msg.contains("HTTP 403") || msg.contains("HTTP 401") || msg.contains("HTTP 406")
+                    if (!isUaRecoverable) break
+                }
+            }
+        }
+        throw lastError ?: IllegalStateException("Unable to connect to Xtream server at $primaryBase.")
+    }
+
+    private fun executeSingleXtreamRequest(
+        base: String,
+        user: String,
+        pass: String,
+        action: String?,
+        extra: Map<String, String>,
+        userAgent: String
+    ): String {
         val urlBuilder = "$base/player_api.php".toHttpUrlOrNull()?.newBuilder()
             ?: error("Invalid Xtream portal URL: $base")
         urlBuilder.addQueryParameter("username", user)
@@ -174,12 +260,12 @@ class XtreamAndM3uService(private val context: Context) {
         extra.forEach { (k, v) -> urlBuilder.addQueryParameter(k, v) }
 
         val client = RoutingManager.buildHttpClient(
-            connectTimeoutSec = 8L,
-            readTimeoutSec = 12L
+            connectTimeoutSec = XTREAM_CONNECT_TIMEOUT_SEC,
+            readTimeoutSec = XTREAM_READ_TIMEOUT_SEC
         )
         val request = Request.Builder()
             .url(urlBuilder.build())
-            .header("User-Agent", "TiviWaveTV/1.0 (AndroidTV)")
+            .header("User-Agent", userAgent)
             .header("Accept", "application/json, */*")
             .get()
             .build()
@@ -187,10 +273,16 @@ class XtreamAndM3uService(private val context: Context) {
         client.newCall(request).execute().use { response ->
             val body = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
-                val reason = when (response.code) {
-                    401, 403 -> "invalid credentials or access blocked"
-                    404 -> "player_api.php not found at $base"
-                    in 500..599 -> "Xtream server error"
+                val isCloudflare = response.header("Server")?.contains("cloudflare", ignoreCase = true) == true ||
+                    response.header("CF-RAY") != null ||
+                    body.contains("cloudflare", ignoreCase = true)
+                val reason = when {
+                    isCloudflare && response.code == 403 ->
+                        "blocked by Cloudflare/geo-filter — try a Country/Proxy node"
+                    response.code == 401 || response.code == 403 ->
+                        "invalid credentials or access blocked"
+                    response.code == 404 -> "player_api.php not found at $base"
+                    response.code in 500..599 -> "Xtream server error"
                     else -> "HTTP error"
                 }
                 error("Xtream API HTTP ${response.code} ($reason)")
@@ -200,21 +292,26 @@ class XtreamAndM3uService(private val context: Context) {
     }
 
     /**
-     * Calls base `player_api.php` (without `action`) and inspects `user_info` (`auth`, `status`, `exp_date`)
-     * to provide accurate, actionable error messages when credentials, account status, or URL fail.
+     * Inspects base `player_api.php` `user_info` (`auth`, `status`, `exp_date`).
+     * Throws immediately ONLY on explicit credential/account rejection (auth=0, Expired, Banned, Disabled);
+     * otherwise lets category, stream, and get.php fallbacks proceed smoothly.
      */
-    private fun validateXtreamAccount(source: PlaylistSource): XtreamAccountInfo {
-        val base = normalizeBaseUrl(source.portalUrl)
-        val raw = executeXtreamApi(source, action = null).trim()
-        if (raw.isEmpty()) {
-            error("Xtream server at $base returned an empty response. Check Host URL or proxy settings.")
-        }
-        if (raw.startsWith("<")) {
-            error("Server at $base returned an HTML page instead of Xtream API JSON. Verify the Host URL.")
+    private fun inspectXtreamAccount(source: PlaylistSource): XtreamAccountInfo {
+        val raw = runCatching { executeXtreamApi(source, action = null).trim() }
+            .getOrElse { err ->
+                // Re-throw clear auth/HTTP errors only if server explicitly answered 401/403;
+                // let fallback probe continue if base endpoint returned 404/non-standard format.
+                val msg = err.message.orEmpty()
+                if (msg.contains("HTTP 401")) throw err
+                return XtreamAccountInfo(status = "Unknown", expDateFormatted = "")
+            }
+
+        if (raw.isEmpty() || raw.startsWith("<")) {
+            return XtreamAccountInfo(status = "Unknown", expDateFormatted = "")
         }
 
         val root = runCatching { JSONObject(raw) }.getOrNull()
-            ?: error("Server at $base returned an invalid Xtream JSON response. Verify the Host URL.")
+            ?: return XtreamAccountInfo(status = "Unknown", expDateFormatted = "")
 
         val userInfo = root.optJSONObject("user_info")
             ?: return XtreamAccountInfo(status = "Active", expDateFormatted = "")
@@ -237,10 +334,8 @@ class XtreamAndM3uService(private val context: Context) {
         val formattedExp = if (expSec > 0L) formatUnixDate(expSec) else ""
 
         val status = userInfo.optCleanString("status")
-        if (status.isNotBlank() &&
-            !status.equals("Active", ignoreCase = true) &&
-            !status.equals("Trial", ignoreCase = true)
-        ) {
+        val badStatuses = setOf("expired", "banned", "disabled", "suspended", "inactive")
+        if (status.lowercase(Locale.US) in badStatuses) {
             val expSuffix = if (formattedExp.isNotBlank()) " (exp: $formattedExp)" else ""
             error("Xtream account status is '$status'$expSuffix. Check subscription with your provider.")
         }
@@ -259,13 +354,20 @@ class XtreamAndM3uService(private val context: Context) {
         ContentType.entries.forEach { type ->
             xtreamFallbackBuffer.remove("${sourceId}:${type.name}")
         }
+        parsedItemBuffer.remove(sourceId)
     }
 
+    /**
+     * 3-Tier Universal Xtream Category Loader:
+     * 1. `get_live_categories`, `get_vod_categories`, `get_series_categories` (JSONArray & JSONObject map)
+     * 2. Stream Fallback: `get_live_streams`, `get_vod_streams`, `get_series` grouped by `category_id` + `category_name`
+     * 3. M3U `get.php` Fallback: automatically downloads `get.php?type=m3u_plus` if `player_api.php` returns nothing
+     */
     private suspend fun fetchXtreamCategories(source: PlaylistSource): List<ContentCategory> = withContext(Dispatchers.IO) {
-        val accountInfo = validateXtreamAccount(source)
         clearXtreamFallbackBuffer(source.id)
+        val accountInfo = inspectXtreamAccount(source)
 
-        val base = normalizeBaseUrl(source.portalUrl)
+        val base = resolvedBaseCache[source.id] ?: normalizeBaseUrl(source.portalUrl)
         val user = source.username.trim()
         val pass = source.password.trim()
         val categories = mutableListOf<ContentCategory>()
@@ -308,9 +410,7 @@ class XtreamAndM3uService(private val context: Context) {
                 typeCategories = parseXtreamCategoriesJson(catRaw, source.id, spec.contentType)
             }
 
-            // Fallback: If get_*_categories returned empty [], fetch corresponding streams
-            // and derive categories automatically from unique category_id + category_name
-            // (or a default category if missing).
+            // Tier 2: Stream fallback if category list returned empty
             if (typeCategories.isEmpty()) {
                 val streamsRaw = runCatching {
                     executeXtreamApi(source, spec.streamAction)
@@ -319,10 +419,11 @@ class XtreamAndM3uService(private val context: Context) {
                 }.getOrNull()
 
                 if (!streamsRaw.isNullOrBlank()) {
+                    val activeBase = resolvedBaseCache[source.id] ?: base
                     typeCategories = buildXtreamCategoriesFromStreams(
                         rawJson = streamsRaw,
                         source = source,
-                        base = base,
+                        base = activeBase,
                         user = user,
                         pass = pass,
                         spec = spec
@@ -334,17 +435,49 @@ class XtreamAndM3uService(private val context: Context) {
         }
 
         val deduped = categories.distinctBy { "${it.type.name}:${it.id}" }
-        if (deduped.isEmpty()) {
-            val detail = lastApiError ?: buildString {
-                append("Xtream account authenticated (Status: ${accountInfo.status}")
-                if (accountInfo.expDateFormatted.isNotBlank()) {
-                    append(", Exp: ${accountInfo.expDateFormatted}")
-                }
-                append("), but the server returned 0 Live, VOD, and Series categories or streams.")
-            }
-            error(detail)
+        if (deduped.isNotEmpty()) {
+            return@withContext deduped
         }
-        deduped
+
+        // Tier 3: Automatic M3U `get.php` fallback for panels that disable `player_api.php`
+        val m3uFallbackCats = tryXtreamGetPhpM3uFallback(source, resolvedBaseCache[source.id] ?: base)
+        if (m3uFallbackCats.isNotEmpty()) {
+            return@withContext m3uFallbackCats
+        }
+
+        val detail = lastApiError ?: buildString {
+            append("Xtream server connected (Status: ${accountInfo.status}")
+            if (accountInfo.expDateFormatted.isNotBlank()) {
+                append(", Exp: ${accountInfo.expDateFormatted}")
+            }
+            append("), but returned 0 Live, VOD, and Series categories or streams.")
+        }
+        error(detail)
+    }
+
+    private fun tryXtreamGetPhpM3uFallback(
+        source: PlaylistSource,
+        base: String
+    ): List<ContentCategory> {
+        val user = source.username.trim()
+        val pass = source.password.trim()
+        if (base.isBlank() || user.isBlank() || pass.isBlank()) return emptyList()
+
+        val candidateUrls = listOf(
+            "$base/get.php?username=$user&password=$pass&type=m3u_plus&output=ts",
+            "$base/get.php?username=$user&password=$pass&type=m3u_plus&output=m3u8"
+        )
+        for (url in candidateUrls) {
+            val text = runCatching { downloadText(url) }.getOrNull()?.trim().orEmpty()
+            if (text.contains("#EXTINF:", ignoreCase = true)) {
+                val (cats, items) = parseM3uContent(source.id, text)
+                if (cats.isNotEmpty() && items.isNotEmpty()) {
+                    parsedItemBuffer[source.id] = items
+                    return cats
+                }
+            }
+        }
+        return emptyList()
     }
 
     private fun parseXtreamCategoriesJson(
@@ -463,7 +596,20 @@ class XtreamAndM3uService(private val context: Context) {
         source: PlaylistSource,
         selectedCategories: List<ContentCategory>
     ): List<MediaItem> = withContext(Dispatchers.IO) {
-        val base = normalizeBaseUrl(source.portalUrl)
+        // If Tier-3 get.php M3U fallback populated parsedItemBuffer for this Xtream source, serve directly
+        val m3uBuffered = parsedItemBuffer[source.id]
+        if (!m3uBuffered.isNullOrEmpty()) {
+            val selectedIds = selectedCategories.map { it.id }.toSet()
+            val matched = m3uBuffered.filter { it.categoryId in selectedIds }
+            if (matched.isNotEmpty()) {
+                val live = matched.filter { it.type == ContentType.LIVE }
+                val vodAndSeries = matched.filter { it.type != ContentType.LIVE }
+                    .sortedByDescending { it.addedAt }
+                return@withContext live + vodAndSeries
+            }
+        }
+
+        val base = resolvedBaseCache[source.id] ?: normalizeBaseUrl(source.portalUrl)
         val user = source.username.trim()
         val pass = source.password.trim()
         val items = mutableListOf<MediaItem>()
@@ -473,7 +619,6 @@ class XtreamAndM3uService(private val context: Context) {
             val rawCatId = category.id.substringAfter('_', category.id)
             val isWildcard = rawCatId.equals("all", ignoreCase = true) || rawCatId == "*"
 
-            // Use Step-1 stream-fallback buffer immediately when available
             val buffered = xtreamFallbackBuffer["${source.id}:${category.type.name}"].orEmpty()
             if (buffered.isNotEmpty()) {
                 val matched = if (isWildcard) buffered else buffered.filter { it.categoryId == category.id }
@@ -493,13 +638,14 @@ class XtreamAndM3uService(private val context: Context) {
             runCatching {
                 val extra = if (isWildcard) emptyMap() else mapOf("category_id" to rawCatId)
                 val raw = executeXtreamApi(source, action, extra)
+                val activeBase = resolvedBaseCache[source.id] ?: base
                 val objects = extractJsonObjectList(raw)
                 for ((i, obj) in objects.withIndex()) {
                     parseXtreamStreamItem(
                         obj = obj,
                         index = i,
                         source = source,
-                        base = base,
+                        base = activeBase,
                         user = user,
                         pass = pass,
                         contentType = category.type,
@@ -508,14 +654,14 @@ class XtreamAndM3uService(private val context: Context) {
                 }
             }
 
-            // If category_id-filtered endpoint returned empty (common on panels that broke category filtering),
-            // fetch unfiltered streams once for this type and filter locally.
+            // If category_id-filtered endpoint returned empty, fetch unfiltered streams once and filter locally
             if (parsedForCategory.isEmpty() && !isWildcard) {
                 val allObjects = unfilteredTypeCache.getOrPut(category.type) {
                     runCatching {
                         extractJsonObjectList(executeXtreamApi(source, action))
                     }.getOrDefault(emptyList())
                 }
+                val activeBase = resolvedBaseCache[source.id] ?: base
                 for ((i, obj) in allObjects.withIndex()) {
                     val objCatIds = extractAllXtreamStreamCategoryIds(obj)
                     val objCatName = obj.optCleanString("category_name")
@@ -528,7 +674,7 @@ class XtreamAndM3uService(private val context: Context) {
                             obj = obj,
                             index = i,
                             source = source,
-                            base = base,
+                            base = activeBase,
                             user = user,
                             pass = pass,
                             contentType = category.type,
@@ -562,6 +708,7 @@ class XtreamAndM3uService(private val context: Context) {
         contentType: ContentType,
         categoryId: String
     ): MediaItem? {
+        val headers = activeXtreamHeaders(source)
         return when (contentType) {
             ContentType.LIVE -> {
                 val streamId = obj.optCleanString("stream_id").ifBlank { obj.optCleanString("id") }
@@ -577,7 +724,8 @@ class XtreamAndM3uService(private val context: Context) {
                     categoryId = categoryId,
                     type = ContentType.LIVE,
                     epgChannelId = obj.optCleanString("epg_channel_id").ifBlank { streamId },
-                    channelNumber = obj.optInt("num", index + 1)
+                    channelNumber = obj.optInt("num", index + 1),
+                    streamHeaders = headers
                 )
             }
 
@@ -609,7 +757,8 @@ class XtreamAndM3uService(private val context: Context) {
                     rating = rating,
                     year = obj.optCleanString("year").ifBlank { extractYearFromTitle(name) },
                     plot = obj.optCleanString("plot"),
-                    addedAt = addedAt
+                    addedAt = addedAt,
+                    streamHeaders = headers
                 )
             }
 
@@ -646,7 +795,8 @@ class XtreamAndM3uService(private val context: Context) {
                         .ifBlank { obj.optCleanString("year") }
                         .ifBlank { extractYearFromTitle(name) },
                     seriesId = seriesId,
-                    addedAt = addedAt
+                    addedAt = addedAt,
+                    streamHeaders = headers
                 )
             }
         }
@@ -693,7 +843,6 @@ class XtreamAndM3uService(private val context: Context) {
         }
         if (trimmed.startsWith("{")) {
             val obj = runCatching { JSONObject(trimmed) }.getOrNull() ?: return emptyList()
-            // Ignore authentication error payloads (`{"user_info": ...}`) when expecting lists
             if (obj.has("user_info") && obj.length() <= 2) return emptyList()
             val keys = obj.keys()
             while (keys.hasNext()) {
@@ -707,14 +856,16 @@ class XtreamAndM3uService(private val context: Context) {
         source: PlaylistSource,
         seriesItem: MediaItem
     ): List<SeasonGroup> = withContext(Dispatchers.IO) {
-        val base = normalizeBaseUrl(source.portalUrl)
+        val base = resolvedBaseCache[source.id] ?: normalizeBaseUrl(source.portalUrl)
         val user = source.username.trim()
         val pass = source.password.trim()
         val seriesId = seriesItem.seriesId.ifBlank { seriesItem.id.substringAfterLast('_') }
 
         val raw = executeXtreamApi(source, "get_series_info", mapOf("series_id" to seriesId))
+        val activeBase = resolvedBaseCache[source.id] ?: base
         val root = runCatching { JSONObject(raw) }.getOrNull() ?: return@withContext emptyList()
         val episodesObj = root.optJSONObject("episodes") ?: return@withContext emptyList()
+        val headers = activeXtreamHeaders(source)
 
         val seasonGroups = mutableListOf<SeasonGroup>()
         val keys = episodesObj.keys()
@@ -734,13 +885,13 @@ class XtreamAndM3uService(private val context: Context) {
                 val title = epObj.optCleanString("title").ifBlank { "Episode $epNum" }
                 val plot = info?.optCleanString("plot").orEmpty().ifBlank { seriesItem.plot }
                 val rawPoster = info?.optCleanString("movie_image").orEmpty()
-                val poster = resolveXtreamAssetUrl(base, rawPoster).ifBlank { seriesItem.posterUrl }
+                val poster = resolveXtreamAssetUrl(activeBase, rawPoster).ifBlank { seriesItem.posterUrl }
 
                 episodes += MediaItem(
                     id = "${source.id}_xep_${seriesId}_${seasonNum}_$epId",
                     sourceId = source.id,
                     title = title,
-                    streamUrlOrCmd = "$base/series/$user/$pass/$epId.$ext",
+                    streamUrlOrCmd = "$activeBase/series/$user/$pass/$epId.$ext",
                     posterUrl = poster,
                     backdropUrl = seriesItem.backdropUrl,
                     categoryId = seriesItem.categoryId,
@@ -751,7 +902,8 @@ class XtreamAndM3uService(private val context: Context) {
                     seriesId = seriesId,
                     seasonNumber = seasonNum,
                     episodeNumber = epNum,
-                    addedAt = seriesItem.addedAt
+                    addedAt = seriesItem.addedAt,
+                    streamHeaders = headers
                 )
             }
 
@@ -921,11 +1073,6 @@ class XtreamAndM3uService(private val context: Context) {
 
     private val rawGistTextCache = ConcurrentHashMap<String, String>()
 
-    /**
-     * Downloads a GitHub Gist JSON URL and inspects whether it is a Multi-Provider Manifest
-     * (e.g. `{"active_providers": [...]}` / `{"providers": [...]}` containing Xtream, Stalker, or M3U entries).
-     * Returns `null` when the Gist is a direct channel/stream JSON or M3U playlist instead.
-     */
     suspend fun resolveGistProvidersIfManifest(source: PlaylistSource): GistManifestResolution? =
         withContext(Dispatchers.IO) {
             val rawUrl = resolveGistRawUrl(source.m3uUrl)
@@ -1278,17 +1425,17 @@ class XtreamAndM3uService(private val context: Context) {
     }
 
     private fun downloadText(rawUrl: String): String {
-        val url = if (rawUrl.startsWith("http://", ignoreCase = true) ||
-            rawUrl.startsWith("https://", ignoreCase = true)
-        ) {
-            rawUrl.trim()
-        } else {
-            "https://${rawUrl.trim()}"
+        val trimmed = rawUrl.trim()
+        val url = when {
+            trimmed.startsWith("http://", ignoreCase = true) ||
+                trimmed.startsWith("https://", ignoreCase = true) -> trimmed
+            trimmed.startsWith("//") -> "https:$trimmed"
+            else -> "https://${trimmed.trimStart('/')}"
         }
         val client = RoutingManager.buildHttpClient(readTimeoutSec = 35L)
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "TiviWaveTV/1.0 (AndroidTV)")
+            .header("User-Agent", XTREAM_USER_AGENTS.first())
             .get()
             .build()
         client.newCall(request).execute().use { response ->

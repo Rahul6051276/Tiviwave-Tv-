@@ -388,12 +388,23 @@ fun TvPlayerScreen(
                     isAutoRecovering = true
                     recoveryJob?.cancel()
                     recoveryJob = scope.launch {
-                        delay(if (nextTry == 1) 800L else 1200L)
-                        if (nextTry == 2) {
-                            onRefreshStream()
-                        } else {
+                        delay(if (nextTry == 1) 700L else 1200L)
+                        if (nextTry == 1) {
+                            val currentUrl = resolvedStream?.url.orEmpty()
+                            val altLiveUrl = when {
+                                isLive && currentUrl.endsWith(".ts", ignoreCase = true) ->
+                                    currentUrl.dropLast(3) + ".m3u8"
+                                isLive && currentUrl.endsWith(".m3u8", ignoreCase = true) ->
+                                    currentUrl.dropLast(5) + ".ts"
+                                else -> null
+                            }
+                            if (altLiveUrl != null) {
+                                exoPlayer.setMediaItem(buildMedia3MediaItem(altLiveUrl))
+                            }
                             exoPlayer.prepare()
                             exoPlayer.playWhenReady = true
+                        } else {
+                            onRefreshStream()
                         }
                     }
                 } else {

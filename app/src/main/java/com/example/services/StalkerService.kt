@@ -26,10 +26,18 @@ class StalkerService {
         const val MAG250_USER_AGENT =
             "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3"
         const val MAG250_X_USER_AGENT = "Model: MAG250; Link: WiFi"
+
+        private val STB_PROFILES = listOf(
+            MAG250_USER_AGENT to MAG250_X_USER_AGENT,
+            "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 4 rev: 2721 Mobile Safari/533.3" to "Model: MAG254; Link: Ethernet"
+        )
+
         private const val MAX_PAGES_PER_CATEGORY = 8
         private const val FALLBACK_PROBE_PAGES = 3
-        private const val CONNECT_TIMEOUT_SEC = 8L
-        private const val READ_TIMEOUT_SEC = 12L
+        private const val FAST_CONNECT_TIMEOUT_SEC = 8L
+        private const val FAST_READ_TIMEOUT_SEC = 12L
+        private const val LIST_CONNECT_TIMEOUT_SEC = 12L
+        private const val LIST_READ_TIMEOUT_SEC = 25L
         private const val SESSION_TTL_MS = 30 * 60_000L
     }
 
@@ -37,8 +45,18 @@ class StalkerService {
         val endpointUrl: String,
         val token: String,
         val random: String = "",
+        val encodeMacCookie: Boolean = false,
+        val profileIndex: Int = 0,
+        val useJsHttpRequest: Boolean = true,
+        val sessionCookies: Map<String, String> = emptyMap(),
         val profileError: String? = null,
         val createdAtMs: Long = System.currentTimeMillis()
+    )
+
+    private data class RawHttpResult(
+        val body: String,
+        val setCookies: Map<String, String>,
+        val finalUrl: String
     )
 
     private data class CategoryFetchOutcome(
@@ -74,34 +92,44 @@ class StalkerService {
         ).joinToString("|")
     }
 
-    private fun buildCookieHeader(source: PlaylistSource): String {
+    private fun buildCookieHeader(
+        source: PlaylistSource,
+        encodeMac: Boolean = false,
+        extraCookies: Map<String, String> = emptyMap()
+    ): String {
         val normalizedMac = normalizeMacAddress(source.macAddress)
+        val macValue = if (encodeMac) URLEncoder.encode(normalizedMac, "UTF-8") else normalizedMac
         val timezone = TimeZone.getDefault().id.ifBlank { "GMT" }
-        val parts = mutableListOf(
-            "mac=$normalizedMac",
-            "stb_lang=en",
-            "timezone=$timezone"
+        val cookieMap = linkedMapOf(
+            "mac" to macValue,
+            "stb_lang" to "en",
+            "timezone" to timezone
         )
-        if (source.serialNumber.isNotBlank()) {
-            parts += "sn=${URLEncoder.encode(source.serialNumber.trim(), "UTF-8")}"
+        extraCookies.forEach { (k, v) ->
+            if (k.isNotBlank() && v.isNotBlank() && k.lowercase(Locale.US) != "mac") {
+                cookieMap[k] = v
+            }
         }
-        if (source.deviceId1.isNotBlank()) {
-            parts += "device_id=${URLEncoder.encode(source.deviceId1.trim(), "UTF-8")}"
-        }
-        if (source.deviceId2.isNotBlank()) {
-            parts += "device_id2=${URLEncoder.encode(source.deviceId2.trim(), "UTF-8")}"
-        }
-        return parts.joinToString("; ")
+        return cookieMap.entries.joinToString("; ") { (k, v) -> "$k=$v" }
     }
 
-    fun buildStalkerHeaders(source: PlaylistSource, token: String? = null): Map<String, String> {
-        val baseReferer = normalizePortalBase(source.portalUrl).trimEnd('/') + "/c/"
+    fun buildStalkerHeaders(
+        source: PlaylistSource,
+        token: String? = null,
+        encodeMacCookie: Boolean = false,
+        profileIndex: Int = 0,
+        extraCookies: Map<String, String> = emptyMap(),
+        endpointOverride: String? = null
+    ): Map<String, String> {
+        val refererBase = normalizePortalBase(endpointOverride ?: source.portalUrl).trimEnd('/') + "/c/"
+        val (ua, xUa) = STB_PROFILES[profileIndex.coerceIn(0, STB_PROFILES.lastIndex)]
         return buildMap {
-            put("User-Agent", MAG250_USER_AGENT)
-            put("X-User-Agent", MAG250_X_USER_AGENT)
-            put("Cookie", buildCookieHeader(source))
-            put("Referer", baseReferer)
+            put("User-Agent", ua)
+            put("X-User-Agent", xUa)
+            put("Cookie", buildCookieHeader(source, encodeMacCookie, extraCookies))
+            put("Referer", refererBase)
             put("Accept", "*/*")
+            put("Accept-Language", "en-US,en;q=0.9")
             put("Connection", "Keep-Alive")
             if (!token.isNullOrBlank()) {
                 put("Authorization", "Bearer $token")
@@ -110,16 +138,17 @@ class StalkerService {
     }
 
     /**
-     * Normalizes Stalker portal base URL cleanly from `/c`, `/c/`, `/c/index.html`,
+     * Normalizes Stalker portal base URL cleanly from `//host/...`, `/c`, `/c/`, `/c/index.html`,
      * `/portal.php`, `/server/load.php`, or root URLs.
      */
     fun normalizePortalBase(rawUrl: String): String {
         var clean = rawUrl.trim()
         if (clean.isBlank()) return ""
-        if (!clean.startsWith("http://", ignoreCase = true) &&
-            !clean.startsWith("https://", ignoreCase = true)
-        ) {
-            clean = "http://$clean"
+        clean = when {
+            clean.startsWith("http://", ignoreCase = true) ||
+                clean.startsWith("https://", ignoreCase = true) -> clean
+            clean.startsWith("//") -> "http:$clean"
+            else -> "http://${clean.trimStart('/')}"
         }
         clean = clean.substringBefore('#').substringBefore('?').trim()
 
@@ -159,6 +188,14 @@ class StalkerService {
         }
     }
 
+    private fun swapScheme(url: String): String? {
+        return when {
+            url.startsWith("http://", ignoreCase = true) -> "https://${url.substring(7)}"
+            url.startsWith("https://", ignoreCase = true) -> "http://${url.substring(8)}"
+            else -> null
+        }
+    }
+
     private fun candidateEndpoints(rawUrl: String): List<String> {
         val trimmed = rawUrl.trim()
         val base = normalizePortalBase(trimmed)
@@ -170,55 +207,83 @@ class StalkerService {
         if (explicitClean.contains("portal.php", ignoreCase = true) ||
             explicitClean.contains("load.php", ignoreCase = true)
         ) {
-            val withScheme = if (explicitClean.startsWith("http://", ignoreCase = true) ||
-                explicitClean.startsWith("https://", ignoreCase = true)
-            ) {
-                explicitClean
-            } else {
-                "http://$explicitClean"
+            val withScheme = when {
+                explicitClean.startsWith("http://", ignoreCase = true) ||
+                    explicitClean.startsWith("https://", ignoreCase = true) -> explicitClean
+                explicitClean.startsWith("//") -> "http:$explicitClean"
+                else -> "http://${explicitClean.trimStart('/')}"
             }
             candidates.add(withScheme.trimEnd('/'))
         }
 
-        if (base.endsWith("/stalker_portal", ignoreCase = true)) {
-            candidates.add("$base/server/load.php")
-            candidates.add("$base/portal.php")
-            if (origin != base) {
-                candidates.add("$origin/portal.php")
-                candidates.add("$origin/server/load.php")
+        fun addForBase(b: String, o: String) {
+            if (b.endsWith("/stalker_portal", ignoreCase = true) ||
+                b.endsWith("/ministra", ignoreCase = true) ||
+                b.endsWith("/portal", ignoreCase = true)
+            ) {
+                candidates.add("$b/server/load.php")
+                candidates.add("$b/portal.php")
+                if (o != b) {
+                    candidates.add("$o/portal.php")
+                    candidates.add("$o/server/load.php")
+                }
+            } else {
+                candidates.add("$b/portal.php")
+                candidates.add("$b/server/load.php")
+                candidates.add("$b/stalker_portal/server/load.php")
+                candidates.add("$b/c/portal.php")
+                candidates.add("$b/c/server/load.php")
+                if (o != b) {
+                    candidates.add("$o/portal.php")
+                    candidates.add("$o/server/load.php")
+                    candidates.add("$o/stalker_portal/server/load.php")
+                }
             }
-        } else {
-            candidates.add("$base/portal.php")
-            candidates.add("$base/server/load.php")
-            candidates.add("$base/stalker_portal/server/load.php")
-            candidates.add("$base/c/portal.php")
-            candidates.add("$base/c/server/load.php")
-            if (origin != base) {
-                candidates.add("$origin/portal.php")
-                candidates.add("$origin/server/load.php")
-                candidates.add("$origin/stalker_portal/server/load.php")
-            }
+        }
+
+        addForBase(base, origin)
+
+        // Automatic HTTP <-> HTTPS scheme fallback for portals that require the alternate scheme
+        val altBase = swapScheme(base)
+        if (altBase != null) {
+            val altOrigin = extractOrigin(altBase)
+            addForBase(altBase, altOrigin)
         }
 
         return candidates.toList()
     }
 
-    private fun executeRequest(
+    private fun executeRequestRaw(
         endpointUrl: String,
         params: Map<String, String>,
         source: PlaylistSource,
-        token: String? = null
-    ): String {
+        token: String? = null,
+        encodeMacCookie: Boolean = false,
+        profileIndex: Int = 0,
+        useJsHttpRequest: Boolean = true,
+        extraCookies: Map<String, String> = emptyMap(),
+        connectTimeoutSec: Long = FAST_CONNECT_TIMEOUT_SEC,
+        readTimeoutSec: Long = FAST_READ_TIMEOUT_SEC
+    ): RawHttpResult {
         val urlBuilder = endpointUrl.toHttpUrlOrNull()?.newBuilder()
             ?: error("Invalid Stalker portal URL: $endpointUrl")
         params.forEach { (k, v) -> urlBuilder.addQueryParameter(k, v) }
-        urlBuilder.addQueryParameter("JsHttpRequest", "1-xml")
+        if (useJsHttpRequest) {
+            urlBuilder.addQueryParameter("JsHttpRequest", "1-xml")
+        }
 
-        val headers = buildStalkerHeaders(source, token)
+        val headers = buildStalkerHeaders(
+            source = source,
+            token = token,
+            encodeMacCookie = encodeMacCookie,
+            profileIndex = profileIndex,
+            extraCookies = extraCookies,
+            endpointOverride = endpointUrl
+        )
         val client = RoutingManager.buildHttpClient(
             customHeaders = headers,
-            connectTimeoutSec = CONNECT_TIMEOUT_SEC,
-            readTimeoutSec = READ_TIMEOUT_SEC
+            connectTimeoutSec = connectTimeoutSec,
+            readTimeoutSec = readTimeoutSec
         )
         val request = Request.Builder()
             .url(urlBuilder.build())
@@ -227,23 +292,107 @@ class StalkerService {
 
         client.newCall(request).execute().use { response ->
             val body = response.body?.string().orEmpty()
+            val cookies = mutableMapOf<String, String>()
+            response.headers("Set-Cookie").forEach { rawCookie ->
+                val pair = rawCookie.substringBefore(';').trim()
+                val eqIdx = pair.indexOf('=')
+                if (eqIdx > 0) {
+                    val ck = pair.substring(0, eqIdx).trim()
+                    val cv = pair.substring(eqIdx + 1).trim()
+                    if (ck.isNotBlank() && cv.isNotBlank() && !cv.equals("deleted", ignoreCase = true)) {
+                        cookies[ck] = cv
+                    }
+                }
+            }
             if (!response.isSuccessful) {
-                val hint = when (response.code) {
-                    401, 403 -> "access denied / unauthorized MAC"
-                    404 -> "endpoint not found"
-                    in 500..599 -> "portal server error"
+                val isCloudflare = response.header("Server")?.contains("cloudflare", ignoreCase = true) == true ||
+                    response.header("CF-RAY") != null ||
+                    body.contains("cloudflare", ignoreCase = true)
+                val hint = when {
+                    isCloudflare && response.code == 403 ->
+                        "blocked by Cloudflare/geo-filter — try a Country/Proxy node or different network"
+                    response.code == 401 || response.code == 403 ->
+                        "access denied / unauthorized MAC"
+                    response.code == 404 -> "endpoint not found"
+                    response.code in 500..599 -> "portal server error"
                     else -> "HTTP error"
                 }
                 error("Stalker portal HTTP ${response.code} ($hint)")
             }
-            return body
+            return RawHttpResult(
+                body = body,
+                setCookies = cookies,
+                finalUrl = response.request.url.toString()
+            )
         }
     }
 
+    private fun executeSessionRequest(
+        session: StalkerSession,
+        params: Map<String, String>,
+        source: PlaylistSource,
+        readTimeoutSec: Long = LIST_READ_TIMEOUT_SEC
+    ): String {
+        val result = executeRequestRaw(
+            endpointUrl = session.endpointUrl,
+            params = params,
+            source = source,
+            token = session.token,
+            encodeMacCookie = session.encodeMacCookie,
+            profileIndex = session.profileIndex,
+            useJsHttpRequest = session.useJsHttpRequest,
+            extraCookies = session.sessionCookies,
+            connectTimeoutSec = LIST_CONNECT_TIMEOUT_SEC,
+            readTimeoutSec = readTimeoutSec
+        )
+        if (result.body.contains("Authorization failed", ignoreCase = true)) {
+            // Some portals expect `token` as a query parameter in addition to Bearer header
+            val retry = executeRequestRaw(
+                endpointUrl = session.endpointUrl,
+                params = params + ("token" to session.token),
+                source = source,
+                token = session.token,
+                encodeMacCookie = session.encodeMacCookie,
+                profileIndex = session.profileIndex,
+                useJsHttpRequest = session.useJsHttpRequest,
+                extraCookies = session.sessionCookies + result.setCookies,
+                connectTimeoutSec = LIST_CONNECT_TIMEOUT_SEC,
+                readTimeoutSec = readTimeoutSec
+            )
+            return retry.body
+        }
+        return result.body
+    }
+
     /**
-     * Performs Stalker handshake (`type=stb&action=handshake`) across normalized standard endpoints
-     * (`portal.php`, `server/load.php`, `stalker_portal/server/load.php`), then probes `get_profile`
-     * on the active load endpoint so the token and endpoint are obtained reliably.
+     * Discovers any redirected portal host/path (for short/vanity Stalker URLs that 301/302 redirect).
+     */
+    private fun probeRedirectedBase(source: PlaylistSource): String? {
+        val base = normalizePortalBase(source.portalUrl)
+        if (base.isBlank()) return null
+        return runCatching {
+            val res = executeRequestRaw(
+                endpointUrl = "$base/c/",
+                params = emptyMap(),
+                source = source,
+                token = null,
+                useJsHttpRequest = false,
+                connectTimeoutSec = 6L,
+                readTimeoutSec = 6L
+            )
+            val redirectedBase = normalizePortalBase(res.finalUrl)
+            if (redirectedBase.isNotBlank() && !redirectedBase.equals(base, ignoreCase = true)) {
+                redirectedBase
+            } else {
+                null
+            }
+        }.getOrNull()
+    }
+
+    /**
+     * Performs universal Stalker handshake across normalized standard endpoints (`portal.php`,
+     * `server/load.php`, `stalker_portal/server/load.php`), HTTP/HTTPS fallback, redirect discovery,
+     * raw vs URL-encoded MAC cookies, and MAG250/MAG254 headers so any valid portal connects reliably.
      */
     private suspend fun ensureSession(
         source: PlaylistSource,
@@ -269,24 +418,41 @@ class StalkerService {
             return@withContext cached
         }
 
-        val endpoints = candidateEndpoints(source.portalUrl).filterNot { it in excludedEndpoints }
+        val initialEndpoints = candidateEndpoints(source.portalUrl).filterNot { it in excludedEndpoints }
         var lastError: Exception? = null
 
-        for (endpoint in endpoints) {
-            try {
-                val handshakeResult = performHandshake(endpoint, source) ?: continue
-                val (initialToken, random) = handshakeResult
-                val verified = verifyAndProbeLoadEndpoint(
-                    handshakeEndpoint = endpoint,
-                    allEndpoints = endpoints,
-                    token = initialToken,
-                    random = random,
-                    source = source
-                )
-                sessionCache[cacheKey] = verified
-                return@withContext verified
-            } catch (e: Exception) {
-                lastError = e
+        fun tryEndpoints(endpoints: List<String>): StalkerSession? {
+            for (endpoint in endpoints) {
+                try {
+                    val handshake = performHandshake(endpoint, source) ?: continue
+                    val verified = verifyAndProbeLoadEndpoint(
+                        handshakeSession = handshake,
+                        allEndpoints = endpoints,
+                        source = source
+                    )
+                    return verified
+                } catch (e: Exception) {
+                    lastError = e
+                }
+            }
+            return null
+        }
+
+        val primaryMatch = tryEndpoints(initialEndpoints)
+        if (primaryMatch != null) {
+            sessionCache[cacheKey] = primaryMatch
+            return@withContext primaryMatch
+        }
+
+        // Fallback: Check if portal vanity URL redirects to a different host/path
+        val redirectedBase = probeRedirectedBase(source)
+        if (redirectedBase != null) {
+            val redirectedEndpoints = candidateEndpoints(redirectedBase)
+                .filterNot { it in excludedEndpoints || it in initialEndpoints }
+            val redirectedMatch = tryEndpoints(redirectedEndpoints)
+            if (redirectedMatch != null) {
+                sessionCache[cacheKey] = redirectedMatch
+                return@withContext redirectedMatch
             }
         }
 
@@ -295,30 +461,59 @@ class StalkerService {
         throw IllegalStateException("Stalker connection failed for MAC $normalizedMac: $reason")
     }
 
-    private fun performHandshake(endpoint: String, source: PlaylistSource): Pair<String, String>? {
-        val paramVariants = listOf(
-            mapOf("type" to "stb", "action" to "handshake", "token" to "", "prehash" to "0"),
-            mapOf("type" to "stb", "action" to "handshake", "token" to "")
+    private fun performHandshake(endpoint: String, source: PlaylistSource): StalkerSession? {
+        data class AttemptConfig(
+            val params: Map<String, String>,
+            val encodeMac: Boolean,
+            val profileIdx: Int,
+            val useJsHttp: Boolean
         )
+
+        val attempts = listOf(
+            // Fast path: Standard MAG250 + raw MAC + prehash=0
+            AttemptConfig(mapOf("type" to "stb", "action" to "handshake", "token" to "", "prehash" to "0"), false, 0, true),
+            // Variant 2: URL-encoded MAC (required by some PHP/Nginx Stalker bridges)
+            AttemptConfig(mapOf("type" to "stb", "action" to "handshake", "token" to "", "prehash" to "0"), true, 0, true),
+            // Variant 3: Without prehash & without JsHttpRequest
+            AttemptConfig(mapOf("type" to "stb", "action" to "handshake", "token" to ""), false, 0, false),
+            // Variant 4: MAG254 STB profile
+            AttemptConfig(mapOf("type" to "stb", "action" to "handshake", "token" to "", "prehash" to "0"), true, 1, true)
+        )
+
         var lastException: Exception? = null
-        for (params in paramVariants) {
+        for (attempt in attempts) {
             try {
-                val raw = executeRequest(
+                val res = executeRequestRaw(
                     endpointUrl = endpoint,
-                    params = params,
+                    params = attempt.params,
                     source = source,
-                    token = null
+                    token = null,
+                    encodeMacCookie = attempt.encodeMac,
+                    profileIndex = attempt.profileIdx,
+                    useJsHttpRequest = attempt.useJsHttp
                 )
-                val json = parseJsonSafely(raw) ?: continue
+                val json = parseJsonSafely(res.body) ?: continue
                 val jsObj = json.optJSONObject("js")
                 val token = jsObj?.optCleanString("token").orEmpty()
                     .ifBlank { json.optCleanString("token") }
                 val random = jsObj?.optCleanString("random").orEmpty()
                 if (token.isNotBlank()) {
-                    return token to random
+                    return StalkerSession(
+                        endpointUrl = endpoint,
+                        token = token,
+                        random = random,
+                        encodeMacCookie = attempt.encodeMac,
+                        profileIndex = attempt.profileIdx,
+                        useJsHttpRequest = attempt.useJsHttp,
+                        sessionCookies = res.setCookies
+                    )
                 }
             } catch (e: Exception) {
                 lastException = e
+                // If endpoint is a clear 404 (not found), skip trying other variants on this same missing path
+                if (e.message?.contains("HTTP 404") == true) {
+                    throw e
+                }
             }
         }
         if (lastException != null) throw lastException
@@ -326,10 +521,8 @@ class StalkerService {
     }
 
     private fun verifyAndProbeLoadEndpoint(
-        handshakeEndpoint: String,
+        handshakeSession: StalkerSession,
         allEndpoints: List<String>,
-        token: String,
-        random: String,
         source: PlaylistSource
     ): StalkerSession {
         val normalizedMac = normalizeMacAddress(source.macAddress)
@@ -342,12 +535,12 @@ class StalkerService {
                 "ImageDescription: 0.2.18-r23-250; ImageDate: Wed Aug 29 10:49:53 EEST 2018; PORTAL version: 5.6.1; API Version: JS API version: 343; STB API version: 146; Player Engine version: 0x58c"
             )
             put("num_banks", "2")
-            put("stb_type", "MAG250")
+            put("stb_type", if (handshakeSession.profileIndex == 0) "MAG250" else "MAG254")
             put("image_version", "218")
             put("auth_second_step", "1")
             put("hw_version", "1.7-BD-00")
             put("not_valid_token", "0")
-            if (random.isNotBlank()) put("random", random)
+            if (handshakeSession.random.isNotBlank()) put("random", handshakeSession.random)
             put(
                 "metrics",
                 "{\"mac\":\"$normalizedMac\",\"sn\":\"${source.serialNumber.trim()}\",\"model\":\"MAG250\",\"type\":\"STB\"}"
@@ -358,8 +551,7 @@ class StalkerService {
             if (source.signature.isNotBlank()) put("signature", source.signature.trim())
         }
 
-        // Probe the handshake endpoint first, then companion standard load endpoints (server/load.php / portal.php)
-        val probeOrder = linkedSetOf(handshakeEndpoint)
+        val probeOrder = linkedSetOf(handshakeSession.endpointUrl)
         allEndpoints.forEach { ep ->
             if (ep.endsWith("/server/load.php", ignoreCase = true) ||
                 ep.endsWith("/portal.php", ignoreCase = true)
@@ -370,18 +562,22 @@ class StalkerService {
 
         var profileError: String? = null
         for (probeEndpoint in probeOrder) {
-            val raw = runCatching {
-                executeRequest(
+            val res = runCatching {
+                executeRequestRaw(
                     endpointUrl = probeEndpoint,
                     params = profileParams,
                     source = source,
-                    token = token
+                    token = handshakeSession.token,
+                    encodeMacCookie = handshakeSession.encodeMacCookie,
+                    profileIndex = handshakeSession.profileIndex,
+                    useJsHttpRequest = handshakeSession.useJsHttpRequest,
+                    extraCookies = handshakeSession.sessionCookies
                 )
             }.getOrNull() ?: continue
 
-            val json = parseJsonSafely(raw) ?: continue
+            val json = parseJsonSafely(res.body) ?: continue
             val jsObj = json.optJSONObject("js")
-            val updatedToken = jsObj?.optCleanString("token").orEmpty().ifBlank { token }
+            val updatedToken = jsObj?.optCleanString("token").orEmpty().ifBlank { handshakeSession.token }
             val explicitMsg = jsObj?.optCleanString("msg").orEmpty()
                 .ifBlank { jsObj?.optCleanString("message").orEmpty() }
                 .ifBlank { json.optCleanString("msg") }
@@ -402,20 +598,15 @@ class StalkerService {
                 profileError = explicitMsg
             }
 
-            return StalkerSession(
+            return handshakeSession.copy(
                 endpointUrl = probeEndpoint,
                 token = updatedToken,
-                random = random,
+                sessionCookies = handshakeSession.sessionCookies + res.setCookies,
                 profileError = profileError
             )
         }
 
-        return StalkerSession(
-            endpointUrl = handshakeEndpoint,
-            token = token,
-            random = random,
-            profileError = profileError
-        )
+        return handshakeSession.copy(profileError = profileError)
     }
 
     /**
@@ -449,12 +640,10 @@ class StalkerService {
         val remainingEndpoints = candidateEndpoints(source.portalUrl).filterNot { it in triedEndpoints }
         for (altEndpoint in remainingEndpoints) {
             val altSession = runCatching {
-                val (tok, rnd) = performHandshake(altEndpoint, source) ?: return@runCatching null
+                val hs = performHandshake(altEndpoint, source) ?: return@runCatching null
                 verifyAndProbeLoadEndpoint(
-                    handshakeEndpoint = altEndpoint,
+                    handshakeSession = hs,
                     allEndpoints = remainingEndpoints,
-                    token = tok,
-                    random = rnd,
                     source = source
                 )
             }.getOrNull() ?: continue
@@ -501,11 +690,10 @@ class StalkerService {
 
             for (action in actions) {
                 val response = runCatching {
-                    executeRequest(
-                        endpointUrl = session.endpointUrl,
+                    executeSessionRequest(
+                        session = session,
                         params = mapOf("type" to stalkerType, "action" to action),
-                        source = source,
-                        token = session.token
+                        source = source
                     )
                 }.onFailure { err ->
                     if (lastError.isNullOrBlank()) lastError = err.message
@@ -542,12 +730,8 @@ class StalkerService {
     }
 
     /**
-     * Parses Stalker category/genre responses supporting:
-     * 1. `{"js": [ {"id": "1", "title": "Sports"}, ... ]}` (JSONArray)
-     * 2. `{"js": { "1": {"id": "1", "title": "Sports"}, ... }}` (JSONObject map of objects)
-     * 3. `{"js": { "1": "Sports", "2": "News" }}` (JSONObject map of id -> title)
-     * 4. `{"js": { "data": [ ... ] }}` or `{"js": { "categories": [ ... ] }}`
-     * 5. Top-level JSONArray `[ ... ]`
+     * Parses Stalker category/genre responses supporting JSONArray, JSONObject maps, nested data/categories/genres,
+     * and top-level JSONArray responses.
      */
     private fun parseCategoriesFlexible(
         rawBody: String,
@@ -669,7 +853,6 @@ class StalkerService {
         val rawItems = mutableListOf<JSONObject>()
         val filterParamKey = if (contentType == ContentType.LIVE) "genre" else "category"
 
-        // Probe get_ordered_list (first with wildcard, then without filter param if needed)
         val probeVariants = buildList {
             if (contentType == ContentType.LIVE) {
                 add(mapOf("type" to stalkerType, "action" to "get_ordered_list", filterParamKey to "*", "sortby" to "number"))
@@ -685,11 +868,10 @@ class StalkerService {
             var page = 1
             while (page <= FALLBACK_PROBE_PAGES) {
                 val raw = runCatching {
-                    executeRequest(
-                        endpointUrl = session.endpointUrl,
+                    executeSessionRequest(
+                        session = session,
                         params = baseParams + ("p" to page.toString()),
-                        source = source,
-                        token = session.token
+                        source = source
                     )
                 }.onFailure { err ->
                     err.message?.let(onError)
@@ -710,14 +892,12 @@ class StalkerService {
             if (rawItems.isNotEmpty()) break
         }
 
-        // Additional Stalker Live TV fallback: `type=itv&action=get_all_channels`
         if (rawItems.isEmpty() && contentType == ContentType.LIVE) {
             val allRaw = runCatching {
-                executeRequest(
-                    endpointUrl = session.endpointUrl,
+                executeSessionRequest(
+                    session = session,
                     params = mapOf("type" to "itv", "action" to "get_all_channels"),
-                    source = source,
-                    token = session.token
+                    source = source
                 )
             }.onFailure { err ->
                 err.message?.let(onError)
@@ -862,7 +1042,6 @@ class StalkerService {
      * Step 2 Selective Import: Strictly downloads items ONLY for checked categories.
      * Passes `sortby=added` for VOD and Web Series so newly uploaded server releases are
      * fetched and sorted at the very top (descending by `added` timestamp / numeric ID).
-     * Automatically handles fallback-grouped categories and `"All Channels"` / `"All VOD"` / `"All Series"`.
      */
     suspend fun fetchItemsForCategories(
         source: PlaylistSource,
@@ -899,12 +1078,7 @@ class StalkerService {
                 }
 
                 var raw = runCatching {
-                    executeRequest(
-                        endpointUrl = session.endpointUrl,
-                        params = baseParams,
-                        source = source,
-                        token = session.token
-                    )
+                    executeSessionRequest(session = session, params = baseParams, source = source)
                 }.getOrNull()
 
                 var pageObjects = raw?.let { extractStalkerItemObjects(it) }.orEmpty()
@@ -919,12 +1093,7 @@ class StalkerService {
                         put("p", "1")
                     }
                     raw = runCatching {
-                        executeRequest(
-                            endpointUrl = session.endpointUrl,
-                            params = retryParams,
-                            source = source,
-                            token = session.token
-                        )
+                        executeSessionRequest(session = session, params = retryParams, source = source)
                     }.getOrNull()
                     pageObjects = raw?.let { extractStalkerItemObjects(it) }.orEmpty()
                 }
@@ -948,14 +1117,10 @@ class StalkerService {
                 page++
             }
 
-            // Fallback 1: Use Step-1 stream-fallback buffer if `get_ordered_list` returned nothing
+            // Fallback 1: Step-1 stream-fallback buffer
             if (categoryItems.isEmpty()) {
                 val buffered = fallbackItemBuffer["${source.id}:${category.type.name}"].orEmpty()
-                val matched = if (isWildcard) {
-                    buffered
-                } else {
-                    buffered.filter { it.categoryId == category.id }
-                }
+                val matched = if (isWildcard) buffered else buffered.filter { it.categoryId == category.id }
                 if (matched.isNotEmpty()) {
                     categoryItems += matched
                 }
@@ -965,11 +1130,10 @@ class StalkerService {
             if (categoryItems.isEmpty() && category.type == ContentType.LIVE) {
                 val allLiveObjs = allLiveChannelsCache ?: run {
                     val allRaw = runCatching {
-                        executeRequest(
-                            endpointUrl = session.endpointUrl,
+                        executeSessionRequest(
+                            session = session,
                             params = mapOf("type" to "itv", "action" to "get_all_channels"),
-                            source = source,
-                            token = session.token
+                            source = source
                         )
                     }.getOrNull()
                     val parsed = allRaw?.let { extractStalkerItemObjects(it) }.orEmpty()
@@ -1014,8 +1178,6 @@ class StalkerService {
             obj.optJSONArray("cmds")?.optJSONObject(0)?.optCleanString("url").orEmpty()
         }
 
-        // For VOD & Series prioritize unique item artwork (`screenshot_uri` / `cover` / `poster`)
-        // before falling back to `logo` so series cards never show a shared/generic logo.
         val rawPoster = when (category.type) {
             ContentType.LIVE -> firstValidImageField(obj, listOf("logo", "screenshot_uri", "pic", "cover"))
             ContentType.VOD,
@@ -1029,8 +1191,9 @@ class StalkerService {
             listOf("backdrop_path", "backdrop", "screenshot_uri", "cover", "poster", "pic")
         ).ifBlank { rawPoster }
 
-        val resolvedPoster = resolvePortalAssetUrl(source.portalUrl, rawPoster)
-        val resolvedBackdrop = resolvePortalAssetUrl(source.portalUrl, rawBackdrop)
+        val assetBase = session.endpointUrl.ifBlank { source.portalUrl }
+        val resolvedPoster = resolvePortalAssetUrl(assetBase, rawPoster)
+        val resolvedBackdrop = resolvePortalAssetUrl(assetBase, rawBackdrop)
 
         val number = obj.optCleanString("number").toIntOrNull() ?: 0
         val rating = normalizeRating(
@@ -1042,7 +1205,6 @@ class StalkerService {
             .ifBlank { extractYearFromTitle(name) }
         val plot = obj.optCleanString("description")
 
-        // Parse Stalker `added` date/timestamp, falling back to numeric item ID for deterministic newest-first order
         val addedRaw = obj.optCleanString("added")
             .ifBlank { obj.optCleanString("added_timestamp") }
             .ifBlank { obj.optCleanString("last_modified") }
@@ -1065,7 +1227,14 @@ class StalkerService {
             seriesId = if (category.type == ContentType.SERIES) rawId else "",
             channelNumber = number,
             addedAt = addedAt,
-            streamHeaders = buildStalkerHeaders(source, session.token)
+            streamHeaders = buildStalkerHeaders(
+                source = source,
+                token = session.token,
+                encodeMacCookie = session.encodeMacCookie,
+                profileIndex = session.profileIndex,
+                extraCookies = session.sessionCookies,
+                endpointOverride = session.endpointUrl
+            )
         )
     }
 
@@ -1081,16 +1250,15 @@ class StalkerService {
             seriesItem.id.substringAfterLast('_')
         }
 
-        val seasonsRaw = executeRequest(
-            endpointUrl = session.endpointUrl,
+        val seasonsRaw = executeSessionRequest(
+            session = session,
             params = mapOf(
                 "type" to "series",
                 "action" to "get_ordered_list",
                 "movie_id" to rawSeriesId,
                 "p" to "1"
             ),
-            source = source,
-            token = session.token
+            source = source
         )
         val seasonsData = extractStalkerItemObjects(seasonsRaw)
         if (seasonsData.isEmpty()) return@withContext emptyList()
@@ -1102,8 +1270,8 @@ class StalkerService {
             val seasonNum = Regex("\\d+").find(seasonName)?.value?.toIntOrNull() ?: (i + 1)
 
             val episodesRaw = runCatching {
-                executeRequest(
-                    endpointUrl = session.endpointUrl,
+                executeSessionRequest(
+                    session = session,
                     params = mapOf(
                         "type" to "series",
                         "action" to "get_ordered_list",
@@ -1111,14 +1279,21 @@ class StalkerService {
                         "season_id" to seasonId,
                         "p" to "1"
                     ),
-                    source = source,
-                    token = session.token
+                    source = source
                 )
             }.getOrNull()
 
             val episodesList = mutableListOf<MediaItem>()
             val episodesObjects = episodesRaw?.let { extractStalkerItemObjects(it) }.orEmpty()
             val seriesCmd = seasonObj.optCleanString("cmd").ifBlank { seriesItem.streamUrlOrCmd }
+            val headers = buildStalkerHeaders(
+                source = source,
+                token = session.token,
+                encodeMacCookie = session.encodeMacCookie,
+                profileIndex = session.profileIndex,
+                extraCookies = session.sessionCookies,
+                endpointOverride = session.endpointUrl
+            )
 
             if (episodesObjects.isNotEmpty()) {
                 for ((e, epObj) in episodesObjects.withIndex()) {
@@ -1142,7 +1317,7 @@ class StalkerService {
                         seasonNumber = seasonNum,
                         episodeNumber = epNum,
                         addedAt = seriesItem.addedAt,
-                        streamHeaders = buildStalkerHeaders(source, session.token)
+                        streamHeaders = headers
                     )
                 }
             } else {
@@ -1166,7 +1341,7 @@ class StalkerService {
                             seasonNumber = seasonNum,
                             episodeNumber = epNum,
                             addedAt = seriesItem.addedAt,
-                            streamHeaders = buildStalkerHeaders(source, session.token)
+                            streamHeaders = headers
                         )
                     }
                 }
@@ -1187,7 +1362,7 @@ class StalkerService {
     /**
      * Dynamically resolves a playable stream URL via Stalker `create_link`.
      * Handles `js.url`, `js.cmd`, `js.stream_url`, top-level `url`/`cmd`, raw `js` strings,
-     * relative portal paths, and strips `ffmpeg `, `ffrt* `, `ext `, `auto `, `solution `, `vlc `, quotes, and stray spaces.
+     * `localhost`/`127.0.0.1` host rewriting, relative portal paths, and command prefixes.
      * Reuses cached token for instant zapping and re-handshakes once if token expired.
      */
     suspend fun resolveStreamLink(
@@ -1196,7 +1371,6 @@ class StalkerService {
         forceSessionRefresh: Boolean = false
     ): ResolvedStream = withContext(Dispatchers.IO) {
         val rawCmd = item.streamUrlOrCmd.trim()
-        val directCleaned = normalizePlayableStreamUrl(source.portalUrl, rawCmd)
 
         val episodeSuffix = if (rawCmd.contains("||episode=")) {
             rawCmd.substringAfter("||episode=")
@@ -1234,6 +1408,12 @@ class StalkerService {
             resolvedUrl = executeCreateLink(session, params, source)
         }
 
+        // Some hybrid portals serve series under `type=series` rather than `type=vod`
+        if (resolvedUrl.isBlank() && item.type == ContentType.SERIES) {
+            resolvedUrl = executeCreateLink(session, params + ("type" to "series"), source)
+        }
+
+        val directCleaned = normalizePlayableStreamUrl(session.endpointUrl.ifBlank { source.portalUrl }, cleanCmdForApi)
         val finalUrl = resolvedUrl.ifBlank { directCleaned }
         if (finalUrl.isBlank()) {
             error("Unable to resolve playable URL from Stalker create_link")
@@ -1241,7 +1421,14 @@ class StalkerService {
 
         ResolvedStream(
             url = finalUrl,
-            headers = buildStalkerHeaders(source, session.token)
+            headers = buildStalkerHeaders(
+                source = source,
+                token = session.token,
+                encodeMacCookie = session.encodeMacCookie,
+                profileIndex = session.profileIndex,
+                extraCookies = session.sessionCookies,
+                endpointOverride = session.endpointUrl
+            )
         )
     }
 
@@ -1251,11 +1438,11 @@ class StalkerService {
         source: PlaylistSource
     ): String {
         val responseRaw = runCatching {
-            executeRequest(
-                endpointUrl = session.endpointUrl,
+            executeSessionRequest(
+                session = session,
                 params = params,
                 source = source,
-                token = session.token
+                readTimeoutSec = FAST_READ_TIMEOUT_SEC
             )
         }.getOrNull() ?: return ""
 
@@ -1273,7 +1460,7 @@ class StalkerService {
                     .ifBlank { json.optCleanString("cmd") }
             }
         }
-        return normalizePlayableStreamUrl(source.portalUrl, rawCandidate)
+        return normalizePlayableStreamUrl(session.endpointUrl.ifBlank { source.portalUrl }, rawCandidate)
     }
 
     /**
@@ -1286,8 +1473,8 @@ class StalkerService {
         if (channelEpgId.isBlank()) return@withContext emptyList()
         runCatching {
             val session = ensureSession(source)
-            val raw = executeRequest(
-                endpointUrl = session.endpointUrl,
+            val raw = executeSessionRequest(
+                session = session,
                 params = mapOf(
                     "type" to "itv",
                     "action" to "get_short_epg",
@@ -1295,7 +1482,7 @@ class StalkerService {
                     "size" to "10"
                 ),
                 source = source,
-                token = session.token
+                readTimeoutSec = FAST_READ_TIMEOUT_SEC
             )
             val items = extractStalkerItemObjects(raw)
             val programs = mutableListOf<EpgProgram>()
@@ -1318,15 +1505,28 @@ class StalkerService {
 
     /**
      * Normalizes A-to-Z IPTV stream/media URLs (.m3u8, .mpd, .ts, .mp4, .mkv, .avi, .mov, .mp3, .aac, raw/proxy URLs):
-     * strips `ffmpeg `, `ffrt `, `ffrt2 `, `ffrt3 `, `ffrt4 `, `ext `, `auto `, `solution `, `vlc `, stray quotes/escapes,
-     * and resolves relative paths cleanly against the portal base URL.
+     * strips `ffmpeg `, `ffrt* `, `ext `, `auto `, `solution `, `vlc `, quotes/escapes, rewrites `localhost`/`127.0.0.1`
+     * to the actual portal host, and resolves relative paths cleanly against the portal base URL.
      */
     fun normalizePlayableStreamUrl(portalUrl: String, rawCmd: String): String {
         val stripped = stripStreamCommandPrefix(rawCmd)
         if (stripped.isBlank()) return ""
         if (stripped.startsWith("http://", ignoreCase = true) ||
-            stripped.startsWith("https://", ignoreCase = true) ||
-            stripped.startsWith("rtsp://", ignoreCase = true) ||
+            stripped.startsWith("https://", ignoreCase = true)
+        ) {
+            val parsedStream = stripped.toHttpUrlOrNull()
+            val parsedPortal = normalizePortalBase(portalUrl).toHttpUrlOrNull()
+            if (parsedStream != null && parsedPortal != null &&
+                (parsedStream.host.equals("localhost", ignoreCase = true) || parsedStream.host == "127.0.0.1")
+            ) {
+                return parsedStream.newBuilder()
+                    .host(parsedPortal.host)
+                    .build()
+                    .toString()
+            }
+            return stripped
+        }
+        if (stripped.startsWith("rtsp://", ignoreCase = true) ||
             stripped.startsWith("rtmp://", ignoreCase = true)
         ) {
             return stripped
@@ -1359,11 +1559,6 @@ class StalkerService {
         return (urlMatch?.value ?: result).trim().trim('"', '\'')
     }
 
-    /**
-     * Resolves Stalker relative asset URLs cleanly against the portal origin or base URL.
-     * Prevents duplicated path segments like `/stalker_portal/stalker_portal/...` that cause
-     * portals to serve a single fallback placeholder poster for every series card.
-     */
     fun resolvePortalAssetUrl(portalUrl: String, assetPath: String): String {
         val clean = assetPath.trim()
         if (clean.isBlank() || clean.equals("null", ignoreCase = true) || clean.equals("false", ignoreCase = true)) {
