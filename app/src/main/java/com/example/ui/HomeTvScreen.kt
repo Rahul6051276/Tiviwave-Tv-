@@ -132,6 +132,7 @@ fun HomeTvScreen(
         Box(modifier = Modifier.fillMaxSize()) {
             CategoryFilterScreen(
                 source = uiState.filterSource,
+                sources = uiState.filterSources,
                 categories = uiState.filterDraftCategories,
                 onToggleCategory = viewModel::toggleDraftCategory,
                 onSelectCountry = viewModel::setDraftCountrySelection,

@@ -39,6 +39,7 @@ data class IptvUiState(
     // 2-Step Country & Category Pre-Load Filter
     val isFilterScreenOpen: Boolean = false,
     val filterSource: PlaylistSource? = null,
+    val filterSources: List<PlaylistSource> = emptyList(),
     val filterDraftCategories: List<ContentCategory> = emptyList(),
 
     // Live TV 3-Pane State
@@ -216,8 +217,8 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
             }
             runCatching {
                 repository.fetchCategoriesForFilter(source)
-            }.onSuccess { categories ->
-                if (categories.isEmpty()) {
+            }.onSuccess { result ->
+                if (result.categories.isEmpty()) {
                     _uiState.update {
                         it.copy(
                             isBusy = false,
@@ -226,14 +227,17 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                 } else {
+                    val primarySource = result.sources.firstOrNull() ?: source
                     _uiState.update {
                         it.copy(
                             isBusy = false,
                             busyMessage = "",
                             isFilterScreenOpen = true,
-                            filterSource = source,
-                            filterDraftCategories = categories,
-                            bannerMessage = "Loaded ${categories.size} categories. Select countries & categories to import."
+                            filterSource = primarySource,
+                            filterSources = result.sources,
+                            filterDraftCategories = result.categories,
+                            bannerMessage = result.summaryMessage
+                                ?: "Loaded ${result.categories.size} categories. Select countries & categories to import."
                         )
                     }
                 }
@@ -263,6 +267,7 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
                     it.copy(
                         isFilterScreenOpen = true,
                         filterSource = source,
+                        filterSources = listOf(source),
                         filterDraftCategories = saved,
                         errorMessage = null
                     )
@@ -276,26 +281,37 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 isFilterScreenOpen = false,
                 filterSource = null,
+                filterSources = emptyList(),
                 filterDraftCategories = emptyList()
             )
         }
     }
 
-    fun toggleDraftCategory(categoryId: String) {
+    fun toggleDraftCategory(sourceId: String, categoryId: String) {
         _uiState.update { state ->
             state.copy(
                 filterDraftCategories = state.filterDraftCategories.map { cat ->
-                    if (cat.id == categoryId) cat.copy(isSelected = !cat.isSelected) else cat
+                    if (cat.sourceId == sourceId && cat.id == categoryId) {
+                        cat.copy(isSelected = !cat.isSelected)
+                    } else {
+                        cat
+                    }
                 }
             )
         }
     }
 
-    fun setDraftCountrySelection(type: ContentType, countryGroup: String, selected: Boolean) {
+    fun setDraftCountrySelection(
+        type: ContentType,
+        countryGroup: String,
+        selected: Boolean,
+        sourceIdFilter: String? = null
+    ) {
         _uiState.update { state ->
             state.copy(
                 filterDraftCategories = state.filterDraftCategories.map { cat ->
-                    if (cat.type == type && cat.countryGroup == countryGroup) {
+                    val matchesSource = sourceIdFilter == null || cat.sourceId == sourceIdFilter
+                    if (matchesSource && cat.type == type && cat.countryGroup == countryGroup) {
                         cat.copy(isSelected = selected)
                     } else {
                         cat
@@ -305,18 +321,26 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun setDraftTabSelection(type: ContentType, selected: Boolean) {
+    fun setDraftTabSelection(
+        type: ContentType,
+        selected: Boolean,
+        sourceIdFilter: String? = null
+    ) {
         _uiState.update { state ->
             state.copy(
                 filterDraftCategories = state.filterDraftCategories.map { cat ->
-                    if (cat.type == type) cat.copy(isSelected = selected) else cat
+                    val matchesSource = sourceIdFilter == null || cat.sourceId == sourceIdFilter
+                    if (matchesSource && cat.type == type) cat.copy(isSelected = selected) else cat
                 }
             )
         }
     }
 
     fun confirmAndImportSelectedCategories() {
-        val source = _uiState.value.filterSource ?: return
+        val sources = _uiState.value.filterSources.ifEmpty {
+            listOfNotNull(_uiState.value.filterSource)
+        }
+        if (sources.isEmpty()) return
         val draftCategories = _uiState.value.filterDraftCategories
         val selectedCount = draftCategories.count { it.isSelected }
         if (selectedCount == 0) {
@@ -330,13 +354,13 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update {
                 it.copy(
                     isBusy = true,
-                    busyMessage = "Importing content for $selectedCount selected categories (excluding unchecked)...",
+                    busyMessage = "Importing content for $selectedCount selected categories across ${sources.size} provider(s)...",
                     errorMessage = null
                 )
             }
             runCatching {
-                repository.importSelectedCategories(source, draftCategories)
-            }.onSuccess { importedCount ->
+                repository.importSelectedCategories(sources, draftCategories)
+            }.onSuccess { (_, recommendedActiveId) ->
                 val hasLive = draftCategories.any { it.isSelected && it.type == ContentType.LIVE }
                 val hasVod = draftCategories.any { it.isSelected && it.type == ContentType.VOD }
                 val targetSection = when {
@@ -350,8 +374,9 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
                         busyMessage = "",
                         isFilterScreenOpen = false,
                         filterSource = null,
+                        filterSources = emptyList(),
                         filterDraftCategories = emptyList(),
-                        activePlaylistId = source.id,
+                        activePlaylistId = recommendedActiveId,
                         currentSection = targetSection,
                         selectedLiveCategoryId = "ALL",
                         selectedVodCategoryId = "ALL",
@@ -361,7 +386,12 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
                         bannerMessage = null
                     )
                 }
-                refreshEpgForPlaylist(source)
+                val activeSourceForEpg = recommendedActiveId?.let { id ->
+                    sources.firstOrNull { it.id == id }
+                } ?: sources.firstOrNull()
+                if (activeSourceForEpg != null) {
+                    refreshEpgForPlaylist(activeSourceForEpg)
+                }
             }.onFailure { err ->
                 _uiState.update {
                     it.copy(

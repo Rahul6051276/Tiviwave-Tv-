@@ -911,12 +911,179 @@ class XtreamAndM3uService(private val context: Context) {
     }
 
     // -------------------------------------------------------------------------
-    // GITHUB GIST JSON SOURCE
+    // GITHUB GIST JSON SOURCE (DIRECT CHANNELS OR MULTI-PROVIDER MANIFEST)
     // -------------------------------------------------------------------------
 
+    data class GistManifestResolution(
+        val providers: List<PlaylistSource>,
+        val skippedUnsupportedNames: List<String> = emptyList()
+    )
+
+    private val rawGistTextCache = ConcurrentHashMap<String, String>()
+
+    /**
+     * Downloads a GitHub Gist JSON URL and inspects whether it is a Multi-Provider Manifest
+     * (e.g. `{"active_providers": [...]}` / `{"providers": [...]}` containing Xtream, Stalker, or M3U entries).
+     * Returns `null` when the Gist is a direct channel/stream JSON or M3U playlist instead.
+     */
+    suspend fun resolveGistProvidersIfManifest(source: PlaylistSource): GistManifestResolution? =
+        withContext(Dispatchers.IO) {
+            val rawUrl = resolveGistRawUrl(source.m3uUrl)
+            val body = downloadText(rawUrl).trim()
+            rawGistTextCache[source.id] = body
+
+            if (body.isEmpty() || body.startsWith("#EXTM3U", ignoreCase = true) || body.contains("#EXTINF:")) {
+                return@withContext null
+            }
+
+            parseGistProvidersManifest(source, body)
+        }
+
+    private fun parseGistProvidersManifest(
+        parentSource: PlaylistSource,
+        jsonText: String
+    ): GistManifestResolution? {
+        val providerArray = extractProviderManifestArray(jsonText) ?: return null
+        val providers = mutableListOf<PlaylistSource>()
+        val skippedUnsupported = mutableListOf<String>()
+        val urlHash = parentSource.m3uUrl.trim().hashCode().toUInt().toString(16)
+
+        for (i in 0 until providerArray.length()) {
+            val obj = providerArray.optJSONObject(i) ?: continue
+            val name = obj.optCleanString("name")
+                .ifBlank { obj.optCleanString("title") }
+                .ifBlank { "Gist Provider ${i + 1}" }
+            val rawType = obj.optCleanString("type").lowercase(Locale.US)
+            val host = obj.optCleanString("host")
+                .ifBlank { obj.optCleanString("portal") }
+                .ifBlank { obj.optCleanString("portal_url") }
+                .ifBlank { obj.optCleanString("server") }
+                .ifBlank { obj.optCleanString("url") }
+            val username = obj.optCleanString("username").ifBlank { obj.optCleanString("user") }
+            val password = obj.optCleanString("password").ifBlank { obj.optCleanString("pass") }
+            val mac = obj.optCleanString("mac").ifBlank { obj.optCleanString("mac_address") }
+            val sn = obj.optCleanString("sn").ifBlank { obj.optCleanString("serial_number") }
+            val dev1 = obj.optCleanString("device_id").ifBlank { obj.optCleanString("device_id1") }
+            val dev2 = obj.optCleanString("device_id2")
+            val signature = obj.optCleanString("signature")
+            val m3uUrl = obj.optCleanString("m3u_url")
+                .ifBlank { obj.optCleanString("m3u") }
+                .ifBlank { obj.optCleanString("url") }
+                .ifBlank { obj.optCleanString("link") }
+            val epgUrl = obj.optCleanString("epg_url").ifBlank { obj.optCleanString("epg") }
+
+            val slug = name.lowercase(Locale.US)
+                .replace(Regex("[^a-z0-9]+"), "_")
+                .trim('_')
+                .ifBlank { "p$i" }
+            val stableId = "gist_${urlHash}_${i}_$slug"
+
+            when {
+                rawType.contains("stremio") || m3uUrl.contains("manifest.json", ignoreCase = true) -> {
+                    skippedUnsupported += "$name (Stremio addon)"
+                }
+                rawType.contains("xtream") || (host.isNotBlank() && username.isNotBlank() && password.isNotBlank()) -> {
+                    if (host.isNotBlank() && username.isNotBlank() && password.isNotBlank()) {
+                        providers += PlaylistSource(
+                            id = stableId,
+                            name = name,
+                            type = SourceType.XTREAM,
+                            portalUrl = host,
+                            username = username,
+                            password = password,
+                            epgUrl = epgUrl,
+                            isActive = true
+                        )
+                    }
+                }
+                rawType.contains("stalker") || rawType.contains("mag") || rawType == "mac" ||
+                    rawType.contains("ministra") || rawType == "stb" || (host.isNotBlank() && mac.isNotBlank()) -> {
+                    if (host.isNotBlank() && mac.isNotBlank()) {
+                        providers += PlaylistSource(
+                            id = stableId,
+                            name = name,
+                            type = SourceType.STALKER,
+                            portalUrl = host,
+                            macAddress = mac,
+                            serialNumber = sn,
+                            deviceId1 = dev1,
+                            deviceId2 = dev2,
+                            signature = signature,
+                            epgUrl = epgUrl,
+                            isActive = true
+                        )
+                    }
+                }
+                rawType.contains("m3u") || rawType.contains("playlist") ||
+                    (m3uUrl.isNotBlank() && (m3uUrl.contains(".m3u", ignoreCase = true) || m3uUrl.contains("get.php", ignoreCase = true))) -> {
+                    if (m3uUrl.isNotBlank()) {
+                        providers += PlaylistSource(
+                            id = stableId,
+                            name = name,
+                            type = SourceType.M3U_URL,
+                            m3uUrl = m3uUrl,
+                            epgUrl = epgUrl,
+                            isActive = true
+                        )
+                    }
+                }
+                else -> {
+                    if (rawType.isNotBlank()) {
+                        skippedUnsupported += "$name ($rawType)"
+                    }
+                }
+            }
+        }
+
+        return if (providers.isNotEmpty() || skippedUnsupported.isNotEmpty()) {
+            GistManifestResolution(
+                providers = providers,
+                skippedUnsupportedNames = skippedUnsupported
+            )
+        } else {
+            null
+        }
+    }
+
+    private fun extractProviderManifestArray(jsonText: String): JSONArray? {
+        val trimmed = jsonText.trim()
+        if (trimmed.startsWith("[")) {
+            val arr = runCatching { JSONArray(trimmed) }.getOrNull() ?: return null
+            if (arr.length() == 0) return null
+            val first = arr.optJSONObject(0) ?: return null
+            val looksLikeProvider = first.has("host") || first.has("username") || first.has("mac") ||
+                first.has("mac_address") || first.has("portal") ||
+                first.optCleanString("type").lowercase(Locale.US) in setOf(
+                    "xtream", "xtream_codes", "stalker", "mag", "mac", "m3u", "m3u8", "stremio"
+                )
+            return if (looksLikeProvider) arr else null
+        }
+
+        if (!trimmed.startsWith("{")) return null
+        val root = runCatching { JSONObject(trimmed) }.getOrNull() ?: return null
+        val manifestKeys = listOf(
+            "active_providers",
+            "providers",
+            "iptv_providers",
+            "servers",
+            "playlists",
+            "accounts",
+            "portals"
+        )
+        for (key in manifestKeys) {
+            val arr = root.optJSONArray(key)
+            if (arr != null && arr.length() > 0) {
+                return arr
+            }
+        }
+        return null
+    }
+
     private suspend fun fetchGistJsonCategories(source: PlaylistSource): List<ContentCategory> = withContext(Dispatchers.IO) {
-        val rawUrl = resolveGistRawUrl(source.m3uUrl)
-        val body = downloadText(rawUrl).trim()
+        val body = rawGistTextCache.remove(source.id) ?: run {
+            val rawUrl = resolveGistRawUrl(source.m3uUrl)
+            downloadText(rawUrl).trim()
+        }
 
         if (body.startsWith("#EXTM3U", ignoreCase = true) || body.contains("#EXTINF:")) {
             val (cats, items) = parseM3uContent(source.id, body)

@@ -17,12 +17,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ClearAll
+import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.LiveTv
@@ -67,30 +69,48 @@ import com.example.ui.theme.TextSecondary
 
 /**
  * 2-Step Country & Category Pre-Load Filter Screen.
- * Step 1: Displays fetched categories split across Live TV, Movies (VOD), and Web Series.
- * Step 2: Groups categories by auto-detected Country/Region; user ticks desired categories
- *         and imports strictly those checked categories (excluding unchecked ones completely).
+ * Supports both single playlists and Multi-Provider Gist manifests (e.g. `providers.json` with
+ * multiple Xtream / Stalker / M3U servers loaded together with zero category ID collisions).
  */
 @Composable
 fun CategoryFilterScreen(
     source: PlaylistSource,
+    sources: List<PlaylistSource> = listOf(source),
     categories: List<ContentCategory>,
-    onToggleCategory: (String) -> Unit,
-    onSelectCountry: (ContentType, String, Boolean) -> Unit,
-    onSelectTabAll: (ContentType, Boolean) -> Unit,
+    onToggleCategory: (sourceId: String, categoryId: String) -> Unit,
+    onSelectCountry: (ContentType, String, Boolean, String?) -> Unit,
+    onSelectTabAll: (ContentType, Boolean, String?) -> Unit,
     onImportSelected: () -> Unit,
     onCancel: () -> Unit
 ) {
     BackHandler { onCancel() }
 
-    val availableTypes = remember(categories) {
-        ContentType.entries.filter { type -> categories.any { it.type == type } }
+    val effectiveSources = remember(source, sources) {
+        sources.ifEmpty { listOf(source) }
+    }
+    val isMultiProvider = effectiveSources.size > 1
+    val sourceNamesById = remember(effectiveSources) {
+        effectiveSources.associate { it.id to it.name }
+    }
+
+    var activeProviderFilterId by remember(effectiveSources) { mutableStateOf<String?>(null) }
+
+    val scopedCategories = remember(categories, activeProviderFilterId) {
+        if (activeProviderFilterId == null) {
+            categories
+        } else {
+            categories.filter { it.sourceId == activeProviderFilterId }
+        }
+    }
+
+    val availableTypes = remember(scopedCategories) {
+        ContentType.entries.filter { type -> scopedCategories.any { it.type == type } }
             .ifEmpty { ContentType.entries }
     }
     var activeTab by remember(source.id) { mutableStateOf(availableTypes.first()) }
 
-    val categoriesForTab = remember(categories, activeTab) {
-        categories.filter { it.type == activeTab }
+    val categoriesForTab = remember(scopedCategories, activeTab) {
+        scopedCategories.filter { it.type == activeTab }
     }
 
     val countryGroups = remember(categoriesForTab) {
@@ -104,7 +124,7 @@ fun CategoryFilterScreen(
         )
     }
 
-    var selectedCountry by remember(activeTab, countryGroups) {
+    var selectedCountry by remember(activeTab, activeProviderFilterId, countryGroups) {
         mutableStateOf(countryGroups.firstOrNull().orEmpty())
     }
     LaunchedEffect(countryGroups) {
@@ -113,10 +133,13 @@ fun CategoryFilterScreen(
         }
     }
 
-    val subCategories = remember(categoriesForTab, selectedCountry) {
+    val subCategories = remember(categoriesForTab, selectedCountry, sourceNamesById) {
         categoriesForTab
             .filter { it.countryGroup == selectedCountry }
-            .sortedBy { it.name.lowercase() }
+            .sortedWith(
+                compareBy<ContentCategory> { it.name.lowercase() }
+                    .thenBy { sourceNamesById[it.sourceId].orEmpty().lowercase() }
+            )
     }
 
     val totalCheckedCount = remember(categories) { categories.count { it.isSelected } }
@@ -130,9 +153,9 @@ fun CategoryFilterScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(ObsidianVoid)
-            .padding(horizontal = 28.dp, vertical = 20.dp)
+            .padding(horizontal = 28.dp, vertical = 18.dp)
     ) {
-        // Header Row: Title + Source Badge + Import Action
+        // Header Row: Title + Source Summary + Import Action
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -154,8 +177,14 @@ fun CategoryFilterScreen(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                    val subtitle = if (isMultiProvider) {
+                        val names = effectiveSources.joinToString(" + ") { it.name }
+                        "${effectiveSources.size} IPTV Providers ($names) • Select categories from any or all providers"
+                    } else {
+                        "${source.name} • ${source.type.displayName} • Unchecked categories will NOT be imported"
+                    }
                     Text(
-                        text = "${source.name} • ${source.type.displayName} • Unchecked categories will NOT be imported",
+                        text = subtitle,
                         style = MaterialTheme.typography.bodyMedium,
                         color = TextMuted,
                         maxLines = 1,
@@ -176,7 +205,79 @@ fun CategoryFilterScreen(
             )
         }
 
-        Spacer(Modifier.height(16.dp))
+        // Multi-Provider Switcher Row (shown when Gist manifest loads 2+ IPTV servers)
+        if (isMultiProvider) {
+            Spacer(Modifier.height(12.dp))
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                item(key = "provider_all") {
+                    val isSelected = activeProviderFilterId == null
+                    TvFocusableSurface(
+                        onClick = { activeProviderFilterId = null },
+                        selected = isSelected,
+                        focusScale = 1.03f,
+                        containerColor = MidnightPanel,
+                        selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.45f),
+                        focusedContainerColor = BroadcastCyan,
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                        modifier = Modifier.testTag("filter_provider_all")
+                    ) { isFocused ->
+                        val tint = if (isFocused) OnCyanDark else if (isSelected) TextPrimary else TextSecondary
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Dns, contentDescription = "All providers", tint = tint, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = "All Providers (${effectiveSources.size})",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = tint,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            TvBadge(
+                                text = "$totalCheckedCount/${categories.size}",
+                                containerColor = if (isFocused) ObsidianVoid.copy(alpha = 0.25f) else ElevatedSlate,
+                                contentColor = if (isFocused) OnCyanDark else BroadcastCyan
+                            )
+                        }
+                    }
+                }
+                items(effectiveSources, key = { it.id }) { provider ->
+                    val isSelected = activeProviderFilterId == provider.id
+                    val pTotal = categories.count { it.sourceId == provider.id }
+                    val pChecked = categories.count { it.sourceId == provider.id && it.isSelected }
+                    TvFocusableSurface(
+                        onClick = { activeProviderFilterId = provider.id },
+                        selected = isSelected,
+                        focusScale = 1.03f,
+                        containerColor = MidnightPanel,
+                        selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.45f),
+                        focusedContainerColor = BroadcastCyan,
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                        modifier = Modifier.testTag("filter_provider_${provider.id}")
+                    ) { isFocused ->
+                        val tint = if (isFocused) OnCyanDark else if (isSelected) TextPrimary else TextSecondary
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "${provider.name} (${provider.type.displayName})",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = tint,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            TvBadge(
+                                text = "$pChecked/$pTotal",
+                                containerColor = if (isFocused) ObsidianVoid.copy(alpha = 0.25f) else ElevatedSlate,
+                                contentColor = if (isFocused) OnCyanDark else if (pChecked > 0) ConnectedEmerald else TextMuted
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
 
         // Top Content Type Tabs: Live TV | Movies (VOD) | Web Series
         Row(
@@ -185,8 +286,8 @@ fun CategoryFilterScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             ContentType.entries.forEachIndexed { index, type ->
-                val countInTab = categories.count { it.type == type }
-                val checkedInTab = categories.count { it.type == type && it.isSelected }
+                val countInTab = scopedCategories.count { it.type == type }
+                val checkedInTab = scopedCategories.count { it.type == type && it.isSelected }
                 val isCurrent = activeTab == type
                 val tabIcon = when (type) {
                     ContentType.LIVE -> Icons.Default.LiveTv
@@ -231,18 +332,18 @@ fun CategoryFilterScreen(
             TvActionButton(
                 text = "Select All ${activeTab.label}",
                 icon = Icons.Default.DoneAll,
-                onClick = { onSelectTabAll(activeTab, true) },
+                onClick = { onSelectTabAll(activeTab, true, activeProviderFilterId) },
                 testTag = "filter_select_all_tab_button"
             )
             TvActionButton(
                 text = "Clear Tab",
                 icon = Icons.Default.ClearAll,
-                onClick = { onSelectTabAll(activeTab, false) },
+                onClick = { onSelectTabAll(activeTab, false, activeProviderFilterId) },
                 testTag = "filter_clear_tab_button"
             )
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(14.dp))
 
         // Main 2-Pane TV Selector: Left = Country/Region Groups, Right = Sub-Categories Checklist
         if (categoriesForTab.isEmpty()) {
@@ -378,13 +479,13 @@ fun CategoryFilterScreen(
                             TvActionButton(
                                 text = "Select All",
                                 icon = Icons.Default.DoneAll,
-                                onClick = { onSelectCountry(activeTab, selectedCountry, true) },
+                                onClick = { onSelectCountry(activeTab, selectedCountry, true, activeProviderFilterId) },
                                 testTag = "filter_select_all_country_button"
                             )
                             TvActionButton(
                                 text = "Clear",
                                 icon = Icons.Default.ClearAll,
-                                onClick = { onSelectCountry(activeTab, selectedCountry, false) },
+                                onClick = { onSelectCountry(activeTab, selectedCountry, false, activeProviderFilterId) },
                                 testTag = "filter_clear_country_button"
                             )
                         }
@@ -396,14 +497,20 @@ fun CategoryFilterScreen(
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         contentPadding = PaddingValues(4.dp)
                     ) {
-                        items(subCategories, key = { it.id }) { cat ->
+                        items(subCategories, key = { "${it.sourceId}::${it.id}" }) { cat ->
+                            val providerName = sourceNamesById[cat.sourceId]
+                            val rowSubtitle = if (isMultiProvider && !providerName.isNullOrBlank()) {
+                                "$providerName • ${cat.countryGroup} • ${cat.type.label}"
+                            } else {
+                                "${cat.countryGroup} • ${cat.type.label}"
+                            }
                             TvCheckboxRow(
                                 title = cat.name,
-                                subtitle = "${cat.countryGroup} • ${cat.type.label}",
+                                subtitle = rowSubtitle,
                                 checked = cat.isSelected,
-                                badgeText = if (cat.itemCount > 0) "${cat.itemCount} items" else null,
-                                onToggle = { onToggleCategory(cat.id) },
-                                testTag = "filter_category_${cat.id}"
+                                badgeText = if (cat.itemCount > 0) "${cat.itemCount} items" else if (isMultiProvider) providerName else null,
+                                onToggle = { onToggleCategory(cat.sourceId, cat.id) },
+                                testTag = "filter_category_${cat.sourceId}_${cat.id}"
                             )
                         }
                     }
