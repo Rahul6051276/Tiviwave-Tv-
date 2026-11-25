@@ -165,10 +165,7 @@ fun HomeTvScreen(
 
     var isRailExpanded by remember { mutableStateOf(false) }
     var showPlaylistSwitcher by remember { mutableStateOf(false) }
-    val railWidth by animateDpAsState(
-        targetValue = if (isRailExpanded) 244.dp else 78.dp,
-        label = "tv_rail_width"
-    )
+    val railWidth = if (isRailExpanded) 236.dp else 74.dp
 
     Box(
         modifier = Modifier

@@ -435,44 +435,53 @@ class IptvViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun focusOrPreviewChannel(channel: MediaItem, startStreamPreview: Boolean = true) {
-        val currentPreview = _uiState.value.previewChannel
+        val previousPreview = _uiState.value.previewChannel
+        val hasActiveStream = _uiState.value.previewStream != null
         _uiState.update { it.copy(previewChannel = channel) }
 
-        // Load Stalker short EPG on-demand if not yet cached
-        val epgKey = channel.epgChannelId.ifBlank { channel.id }
-        if (_uiState.value.epgByChannelId[epgKey].isNullOrEmpty()) {
-            viewModelScope.launch {
-                val shortEpg = repository.fetchStalkerShortEpg(channel)
-                if (shortEpg.isNotEmpty()) {
-                    _uiState.update { state ->
-                        state.copy(epgByChannelId = state.epgByChannelId + (epgKey to shortEpg))
-                    }
-                }
-            }
-        }
-
-        if (!startStreamPreview || (currentPreview?.id == channel.id && _uiState.value.previewStream != null)) {
+        if (!startStreamPreview || (previousPreview?.id == channel.id && hasActiveStream)) {
             return
         }
 
         previewJob?.cancel()
         previewJob = viewModelScope.launch {
-            _uiState.update { it.copy(isPreviewResolving = true, previewStream = null) }
+            // Connect almost immediately on initial entry; debounce rapid D-Pad scrolling so focus never stalls
+            val debounceMs = if (previousPreview == null || !hasActiveStream) 80L else 320L
+            kotlinx.coroutines.delay(debounceMs)
+
+            // Load Stalker short EPG on-demand after focus settles
+            val epgKey = channel.epgChannelId.ifBlank { channel.id }
+            if (_uiState.value.epgByChannelId[epgKey].isNullOrEmpty()) {
+                launch {
+                    val shortEpg = repository.fetchStalkerShortEpg(channel)
+                    if (shortEpg.isNotEmpty()) {
+                        _uiState.update { state ->
+                            state.copy(epgByChannelId = state.epgByChannelId + (epgKey to shortEpg))
+                        }
+                    }
+                }
+            }
+
+            _uiState.update { it.copy(isPreviewResolving = true) }
             runCatching {
                 repository.resolvePlayableStream(channel)
             }.onSuccess { resolved ->
-                _uiState.update {
-                    it.copy(
-                        isPreviewResolving = false,
-                        previewStream = resolved
-                    )
+                if (_uiState.value.previewChannel?.id == channel.id) {
+                    _uiState.update {
+                        it.copy(
+                            isPreviewResolving = false,
+                            previewStream = resolved
+                        )
+                    }
                 }
             }.onFailure {
-                _uiState.update {
-                    it.copy(
-                        isPreviewResolving = false,
-                        previewStream = null
-                    )
+                if (_uiState.value.previewChannel?.id == channel.id) {
+                    _uiState.update {
+                        it.copy(
+                            isPreviewResolving = false,
+                            previewStream = null
+                        )
+                    }
                 }
             }
         }

@@ -3,14 +3,11 @@ package com.example.ui
 import android.view.KeyEvent as AndroidKeyEvent
 import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -61,11 +58,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -74,11 +74,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.media3.common.MediaItem as Media3Item
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout
@@ -228,18 +227,18 @@ fun LiveTvScreen(
     LaunchedEffect(selectedCategoryId, isGroupDrawerOpen, filteredChannels.size) {
         if (!isGroupDrawerOpen && filteredChannels.isNotEmpty()) {
             val activeIdx = filteredChannels.indexOfFirst { it.id == previewChannel?.id }.coerceAtLeast(0)
-            channelListState.scrollToItem(activeIdx)
-            delay(60L)
+            channelListState.scrollToItem((activeIdx - 2).coerceAtLeast(0))
+            delay(50L)
             runCatching { firstChannelFocusRequester.requestFocus() }
         }
     }
 
-    // Move focus straight to the active group when opening the collapsible Group Switcher Drawer
+    // Move focus straight to the active group when opening the Group Switcher Drawer
     LaunchedEffect(isGroupDrawerOpen) {
         if (isGroupDrawerOpen) {
             val idx = groupEntries.indexOfFirst { it.id == selectedCategoryId }.coerceAtLeast(0)
-            groupListState.scrollToItem(idx)
-            delay(60L)
+            groupListState.scrollToItem((idx - 2).coerceAtLeast(0))
+            delay(50L)
             runCatching { activeGroupFocusRequester.requestFocus() }
         }
     }
@@ -464,39 +463,41 @@ fun LiveTvScreen(
                         }
                     }
 
-                    // Active Channel & Current Program Info
+                    // Active Channel & Current Program Info (single clean title, no duplication)
                     if (activePreview != null) {
+                        val activeSeqIndex = remember(filteredChannels, activePreview.id) {
+                            filteredChannels.indexOfFirst { it.id == activePreview.id }.coerceAtLeast(0)
+                        }
                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                if (activePreview.channelNumber > 0) {
-                                    Text(
-                                        text = activePreview.channelNumber.toString().padStart(3, '0'),
-                                        style = MaterialTheme.typography.labelMedium,
-                                        color = BroadcastCyan,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
+                                Text(
+                                    text = (activeSeqIndex + 1).toString().padStart(3, '0'),
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = BroadcastCyan,
+                                    fontWeight = FontWeight.Bold
+                                )
                                 Text(
                                     text = activePreview.title,
+                                    style = MaterialTheme.typography.headlineMedium,
+                                    color = TextPrimary,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+
+                            if (activeNowProgram != null) {
+                                Text(
+                                    text = activeNowProgram.title,
                                     style = MaterialTheme.typography.titleMedium,
                                     color = TextSecondary,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
-                            }
-
-                            Text(
-                                text = activeNowProgram?.title ?: activePreview.title,
-                                style = MaterialTheme.typography.headlineMedium,
-                                color = TextPrimary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-
-                            if (activeNowProgram != null) {
                                 val remainingMin = ((activeNowProgram.endTimeMs - nowMs) / 60_000L).coerceAtLeast(0L)
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
@@ -547,10 +548,10 @@ fun LiveTvScreen(
                                 }
                             } else {
                                 Text(
-                                    text = "$activeGroupName • Live Broadcast Stream",
+                                    text = "$activeGroupName  •  Live Broadcast",
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = TextMuted,
-                                    maxLines = 2,
+                                    maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
                             }
@@ -653,149 +654,23 @@ fun LiveTvScreen(
                             val programs = epgByChannelId[epgKey].orEmpty()
                             val isSelectedChannel = activePreview?.id == channel.id
 
-                            TvFocusableSurface(
-                                onClick = { onOpenFullScreen(channel, filteredChannels) },
-                                onFocused = {
-                                    onFocusChannel(channel)
-                                    scope.launch {
-                                        channelListState.animateScrollToItem(index)
-                                    }
-                                },
-                                selected = isSelectedChannel,
-                                focusScale = 1.015f,
-                                shape = RoundedCornerShape(8.dp),
-                                containerColor = ObsidianBase,
-                                selectedContainerColor = MidnightPanel,
-                                focusedContainerColor = HighlightSlate,
-                                borderColor = Color.Transparent,
-                                focusedBorderColor = BroadcastCyan,
-                                focusedBorderWidth = 2.dp,
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .then(
-                                        if (index == activeFocusIndex) {
-                                            Modifier.focusRequester(firstChannelFocusRequester)
-                                        } else {
-                                            Modifier
-                                        }
-                                    )
-                                    .onPreviewKeyEvent { keyEvent ->
-                                        if (keyEvent.type == KeyEventType.KeyDown &&
-                                            keyEvent.nativeKeyEvent.keyCode == AndroidKeyEvent.KEYCODE_DPAD_LEFT
-                                        ) {
-                                            isGroupDrawerOpen = true
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    }
-                                    .testTag("live_channel_${channel.id}")
-                            ) { isFocused ->
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    // Left Channel Info Strip (~30% width)
-                                    Row(
-                                        modifier = Modifier
-                                            .weight(0.30f)
-                                            .padding(end = 10.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text(
-                                            text = if (channel.channelNumber > 0) {
-                                                channel.channelNumber.toString().padStart(3, '0')
-                                            } else {
-                                                (index + 1).toString().padStart(3, '0')
-                                            },
-                                            style = MaterialTheme.typography.labelMedium,
-                                            color = if (isFocused) BroadcastCyan else TextMuted,
-                                            modifier = Modifier.width(34.dp)
-                                        )
-                                        ChannelLogoThumbnail(
-                                            title = channel.title,
-                                            logoUrl = channel.posterUrl,
-                                            modifier = Modifier.size(36.dp)
-                                        )
-                                        Spacer(Modifier.width(10.dp))
-                                        Text(
-                                            text = channel.title,
-                                            style = MaterialTheme.typography.titleSmall,
-                                            color = if (isFocused || isSelectedChannel) TextPrimary else TextSecondary,
-                                            fontWeight = if (isFocused || isSelectedChannel) FontWeight.SemiBold else FontWeight.Normal,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                            modifier = Modifier.weight(1f)
-                                        )
-                                        if (channel.isFavorite) {
-                                            Spacer(Modifier.width(4.dp))
-                                            Icon(
-                                                imageVector = Icons.Default.Star,
-                                                contentDescription = "Favorite",
-                                                tint = SignalAmber,
-                                                modifier = Modifier.size(14.dp)
-                                            )
-                                        }
-                                    }
-
-                                    // Right Wide EPG Timeline Blocks (~70% width across 4 half-hour slots)
-                                    Row(
-                                        modifier = Modifier.weight(0.70f),
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        timeSlots.forEachIndexed { slotIdx, slotStart ->
-                                            val slotEnd = slotStart + slotDurationMs
-                                            val matchingProgram = programs.firstOrNull { prog ->
-                                                prog.startTimeMs < slotEnd && prog.endTimeMs > slotStart
-                                            }
-                                            val isCurrentSlot = slotIdx == 0
-                                            val cellBg = when {
-                                                isFocused && isCurrentSlot -> BroadcastCyanDeep.copy(alpha = 0.45f)
-                                                isFocused -> ElevatedSlate
-                                                isCurrentSlot && matchingProgram != null -> MidnightPanel
-                                                else -> ObsidianVoid.copy(alpha = 0.65f)
-                                            }
-
-                                            Column(
-                                                modifier = Modifier
-                                                    .weight(1f)
-                                                    .height(42.dp)
-                                                    .clip(RoundedCornerShape(6.dp))
-                                                    .background(cellBg)
-                                                    .padding(horizontal = 8.dp, vertical = 5.dp),
-                                                verticalArrangement = Arrangement.Center
-                                            ) {
-                                                Text(
-                                                    text = matchingProgram?.title ?: if (isCurrentSlot) "Live Broadcast" else "—",
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    color = when {
-                                                        matchingProgram != null && (isFocused || isCurrentSlot) -> TextPrimary
-                                                        matchingProgram != null -> TextSecondary
-                                                        else -> TextMuted.copy(alpha = 0.7f)
-                                                    },
-                                                    fontWeight = if (isCurrentSlot && matchingProgram != null) FontWeight.Medium else FontWeight.Normal,
-                                                    maxLines = 1,
-                                                    overflow = TextOverflow.Ellipsis
-                                                )
-                                                if (isCurrentSlot && matchingProgram != null) {
-                                                    Spacer(Modifier.height(3.dp))
-                                                    LinearProgressIndicator(
-                                                        progress = { matchingProgram.progressAt(nowMs) },
-                                                        color = BroadcastCyan,
-                                                        trackColor = ObsidianVoid.copy(alpha = 0.6f),
-                                                        modifier = Modifier
-                                                            .fillMaxWidth()
-                                                            .height(2.5.dp)
-                                                            .clip(RoundedCornerShape(2.dp))
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
+                            LiveChannelEpgRow(
+                                channel = channel,
+                                sequentialNumber = index + 1,
+                                isSelected = isSelectedChannel,
+                                programs = programs,
+                                timeSlots = timeSlots,
+                                slotDurationMs = slotDurationMs,
+                                nowMs = nowMs,
+                                onFocused = { onFocusChannel(channel) },
+                                onOpenFullScreen = { onOpenFullScreen(channel, filteredChannels) },
+                                onOpenGroups = { isGroupDrawerOpen = true },
+                                modifier = if (index == activeFocusIndex) {
+                                    Modifier.focusRequester(firstChannelFocusRequester)
+                                } else {
+                                    Modifier
                                 }
-                            }
+                            )
                         }
                     }
                 }
@@ -803,18 +678,13 @@ fun LiveTvScreen(
         }
 
         // ---------------------------------------------------------------------
-        // COLLAPSIBLE GROUP SWITCHER DRAWER (ON-DEMAND OVERLAY)
+        // INSTANT ON-DEMAND GROUP SWITCHER DRAWER (ZERO SLIDE STUTTER)
         // ---------------------------------------------------------------------
-        AnimatedVisibility(
-            visible = isGroupDrawerOpen,
-            enter = slideInHorizontally { -it } + fadeIn(),
-            exit = slideOutHorizontally { -it } + fadeOut(),
-            modifier = Modifier.fillMaxSize()
-        ) {
+        if (isGroupDrawerOpen) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(ObsidianVoid.copy(alpha = 0.55f))
+                    .background(ObsidianVoid.copy(alpha = 0.62f))
             ) {
                 Column(
                     modifier = Modifier
@@ -841,22 +711,19 @@ fun LiveTvScreen(
 
                     LazyColumn(
                         state = groupListState,
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(5.dp),
                         contentPadding = PaddingValues(vertical = 4.dp),
                         modifier = Modifier.weight(1f)
                     ) {
-                        itemsIndexed(groupEntries, key = { _, g -> g.id }) { idx, group ->
+                        itemsIndexed(groupEntries, key = { _, g -> g.id }) { _, group ->
                             val isSelected = group.id == selectedCategoryId
                             TvFocusableSurface(
                                 onClick = {
                                     onSelectCategory(group.id)
                                     isGroupDrawerOpen = false
                                 },
-                                onFocused = {
-                                    scope.launch { groupListState.animateScrollToItem(idx) }
-                                },
                                 selected = isSelected,
-                                focusScale = 1.02f,
+                                focusScale = 1.0f,
                                 shape = RoundedCornerShape(8.dp),
                                 containerColor = MidnightPanel,
                                 selectedContainerColor = BroadcastCyanDeep.copy(alpha = 0.38f),
@@ -932,6 +799,179 @@ fun LiveTvScreen(
     }
 }
 
+/**
+ * Lightweight, 60fps Android TV Channel + EPG Timeline Row:
+ * - Zero hardware shadows, zero spring scale layout thrash, zero fighting animateScrollToItem calls.
+ * - Sequential 001, 002, 003... numbering so duplicate server numbers never appear on adjacent rows.
+ */
+@Composable
+private fun LiveChannelEpgRow(
+    channel: MediaItem,
+    sequentialNumber: Int,
+    isSelected: Boolean,
+    programs: List<EpgProgram>,
+    timeSlots: List<Long>,
+    slotDurationMs: Long,
+    nowMs: Long,
+    onFocused: () -> Unit,
+    onOpenFullScreen: () -> Unit,
+    onOpenGroups: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var isFocused by remember { mutableStateOf(false) }
+
+    val rowBg = when {
+        isFocused -> HighlightSlate
+        isSelected -> MidnightPanel
+        else -> ObsidianBase
+    }
+    val rowBorder = when {
+        isFocused -> BroadcastCyan
+        isSelected -> BroadcastCyan.copy(alpha = 0.28f)
+        else -> Color.Transparent
+    }
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(rowBg)
+            .border(
+                width = if (isFocused) 1.5.dp else 1.dp,
+                color = rowBorder,
+                shape = RoundedCornerShape(8.dp)
+            )
+            .onFocusChanged { focusState ->
+                val focusedNow = focusState.isFocused
+                isFocused = focusedNow
+                if (focusedNow) onFocused()
+            }
+            .onPreviewKeyEvent { keyEvent ->
+                if (keyEvent.type == KeyEventType.KeyDown &&
+                    keyEvent.nativeKeyEvent.keyCode == AndroidKeyEvent.KEYCODE_DPAD_LEFT
+                ) {
+                    onOpenGroups()
+                    true
+                } else {
+                    false
+                }
+            }
+            .onKeyEvent { keyEvent ->
+                if (keyEvent.type == KeyEventType.KeyDown &&
+                    keyEvent.nativeKeyEvent.repeatCount == 0 &&
+                    isTvConfirmKey(keyEvent.nativeKeyEvent.keyCode)
+                ) {
+                    onOpenFullScreen()
+                    true
+                } else {
+                    false
+                }
+            }
+            .focusable()
+            .pointerInput(channel.id, onOpenFullScreen) {
+                detectTapGestures(onTap = { onOpenFullScreen() })
+            }
+            .padding(horizontal = 10.dp, vertical = 7.dp)
+            .testTag("live_channel_${channel.id}"),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // Left Channel Info Strip (~30% width)
+        Row(
+            modifier = Modifier
+                .weight(0.30f)
+                .padding(end = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = sequentialNumber.toString().padStart(3, '0'),
+                style = MaterialTheme.typography.labelMedium,
+                color = if (isFocused || isSelected) BroadcastCyan else TextMuted,
+                modifier = Modifier.width(34.dp)
+            )
+            ChannelLogoThumbnail(
+                title = channel.title,
+                logoUrl = channel.posterUrl,
+                modifier = Modifier.size(34.dp)
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                text = channel.title,
+                style = MaterialTheme.typography.titleSmall,
+                color = if (isFocused || isSelected) TextPrimary else TextSecondary,
+                fontWeight = if (isFocused || isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            if (channel.isFavorite) {
+                Spacer(Modifier.width(4.dp))
+                Icon(
+                    imageVector = Icons.Default.Star,
+                    contentDescription = "Favorite",
+                    tint = SignalAmber,
+                    modifier = Modifier.size(14.dp)
+                )
+            }
+        }
+
+        // Right Wide EPG Timeline Blocks (~70% width across 4 half-hour slots)
+        Row(
+            modifier = Modifier.weight(0.70f),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            timeSlots.forEachIndexed { slotIdx, slotStart ->
+                val slotEnd = slotStart + slotDurationMs
+                val matchingProgram = programs.firstOrNull { prog ->
+                    prog.startTimeMs < slotEnd && prog.endTimeMs > slotStart
+                }
+                val isCurrentSlot = slotIdx == 0
+                val cellBg = when {
+                    isFocused && isCurrentSlot -> BroadcastCyanDeep.copy(alpha = 0.45f)
+                    isFocused -> ElevatedSlate
+                    isCurrentSlot && matchingProgram != null -> MidnightPanel
+                    else -> ObsidianVoid.copy(alpha = 0.65f)
+                }
+
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(40.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(cellBg)
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        text = matchingProgram?.title ?: if (isCurrentSlot) "Live Broadcast" else "—",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = when {
+                            matchingProgram != null && (isFocused || isCurrentSlot) -> TextPrimary
+                            matchingProgram != null -> TextSecondary
+                            else -> TextMuted.copy(alpha = 0.7f)
+                        },
+                        fontWeight = if (isCurrentSlot && matchingProgram != null) FontWeight.Medium else FontWeight.Normal,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (isCurrentSlot && matchingProgram != null) {
+                        Spacer(Modifier.height(3.dp))
+                        LinearProgressIndicator(
+                            progress = { matchingProgram.progressAt(nowMs) },
+                            color = BroadcastCyan,
+                            trackColor = ObsidianVoid.copy(alpha = 0.6f),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(2.5.dp)
+                                .clip(RoundedCornerShape(2.dp))
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun ChannelLogoThumbnail(
     title: String,
@@ -986,24 +1026,36 @@ private fun LivePreviewVideoPlayer(
 ) {
     val context = LocalContext.current
     var previewError by remember(resolvedStream.url) { mutableStateOf<String?>(null) }
+    var isPreviewBuffering by remember(resolvedStream.url) { mutableStateOf(true) }
 
     val exoPlayer = remember(resolvedStream.url, resolvedStream.headers) {
-        val httpClient = RoutingManager.buildHttpClient(customHeaders = resolvedStream.headers)
-        val dataSourceFactory = OkHttpDataSource.Factory(httpClient)
+        val dataSourceFactory = buildMedia3DataSourceFactory(resolvedStream.headers)
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(8_000, 20_000, 800, 1_500)
+            .build()
         ExoPlayer.Builder(context)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
+            .setLoadControl(loadControl)
             .build()
             .apply {
                 playWhenReady = true
                 volume = 0.85f
-                setMediaItem(Media3Item.fromUri(resolvedStream.url))
+                setMediaItem(buildMedia3MediaItem(resolvedStream.url))
                 prepare()
             }
     }
 
     DisposableEffect(exoPlayer) {
         val listener = object : Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                isPreviewBuffering = playbackState == Player.STATE_BUFFERING
+                if (playbackState == Player.STATE_READY) {
+                    previewError = null
+                }
+            }
+
             override fun onPlayerError(error: PlaybackException) {
+                isPreviewBuffering = false
                 previewError = error.errorCodeName
             }
         }
@@ -1019,6 +1071,8 @@ private fun LivePreviewVideoPlayer(
             factory = { ctx ->
                 PlayerView(ctx).apply {
                     useController = false
+                    isFocusable = false
+                    isFocusableInTouchMode = false
                     resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                     player = exoPlayer
                 }
@@ -1026,6 +1080,15 @@ private fun LivePreviewVideoPlayer(
             update = { view -> view.player = exoPlayer },
             modifier = Modifier.fillMaxSize()
         )
+        if (isPreviewBuffering && previewError == null) {
+            CircularProgressIndicator(
+                color = BroadcastCyan,
+                strokeWidth = 2.5.dp,
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .size(26.dp)
+            )
+        }
         if (previewError != null) {
             Box(
                 modifier = Modifier

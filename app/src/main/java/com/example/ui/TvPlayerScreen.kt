@@ -78,12 +78,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem as Media3Item
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
@@ -119,6 +122,69 @@ import java.util.Date
 import java.util.Locale
 
 private enum class TrackPickerMode { NONE, AUDIO, SUBTITLES }
+
+private const val MAX_AUTO_RECONNECTS = 2
+private const val DEFAULT_MEDIA_USER_AGENT =
+    "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3"
+
+/**
+ * Shared Media3 HTTP DataSource factory:
+ * - Direct route: uses DefaultHttpDataSource.Factory with allowCrossProtocolRedirects = true,
+ *   crisp 8s/12s timeouts, and proper Stalker/Xtream User-Agent + headers.
+ * - Proxy route: uses proxy-configured OkHttpDataSource.Factory (redirects & SSL redirects enabled).
+ */
+@OptIn(UnstableApi::class)
+internal fun buildMedia3DataSourceFactory(headers: Map<String, String>): DataSource.Factory {
+    val routing = RoutingManager.routingState.value
+    if (routing.isConnected && routing.activeNode != null) {
+        val httpClient = RoutingManager.buildHttpClient(
+            customHeaders = headers,
+            connectTimeoutSec = 8L,
+            readTimeoutSec = 12L
+        )
+        return OkHttpDataSource.Factory(httpClient)
+    }
+
+    val userAgent = headers.entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }
+        ?.value
+        ?.takeIf { it.isNotBlank() }
+        ?: DEFAULT_MEDIA_USER_AGENT
+
+    val filteredHeaders = headers.filter { (k, v) ->
+        k.isNotBlank() && v.isNotBlank() && !k.equals("User-Agent", ignoreCase = true)
+    }
+
+    return DefaultHttpDataSource.Factory()
+        .setUserAgent(userAgent)
+        .setConnectTimeoutMs(8_000)
+        .setReadTimeoutMs(12_000)
+        .setAllowCrossProtocolRedirects(true)
+        .apply {
+            if (filteredHeaders.isNotEmpty()) {
+                setDefaultRequestProperties(filteredHeaders)
+            }
+        }
+}
+
+/**
+ * Builds a Media3 MediaItem supporting A-to-Z live, movie, and series formats/containers:
+ * .m3u8 (HLS), .mpd (DASH), .ts, .mp4, .mkv, .avi, .mov, .mp3, .aac, and raw/proxy IPTV URLs.
+ */
+@OptIn(UnstableApi::class)
+internal fun buildMedia3MediaItem(rawUrl: String): Media3Item {
+    val cleanUrl = rawUrl.trim()
+    val pathNoQuery = cleanUrl.substringBefore('?').substringBefore('#').lowercase(Locale.US)
+    val builder = Media3Item.Builder().setUri(cleanUrl)
+    when {
+        pathNoQuery.endsWith(".m3u8") || cleanUrl.contains(".m3u8", ignoreCase = true) ->
+            builder.setMimeType(MimeTypes.APPLICATION_M3U8)
+        pathNoQuery.endsWith(".mpd") || cleanUrl.contains(".mpd", ignoreCase = true) ->
+            builder.setMimeType(MimeTypes.APPLICATION_MPD)
+        pathNoQuery.endsWith(".ism") || pathNoQuery.endsWith(".isml") ->
+            builder.setMimeType(MimeTypes.APPLICATION_SS)
+    }
+    return builder.build()
+}
 
 /**
  * Full-Screen Hardware-Accelerated Media3 TV Player:
@@ -160,7 +226,9 @@ fun TvPlayerScreen(
     var isPlaying by remember { mutableStateOf(true) }
     var isBuffering by remember { mutableStateOf(true) }
     var playbackError by remember(item.id, resolvedStream?.url) { mutableStateOf<String?>(null) }
-    var reconnectAttempt by remember(item.id, resolvedStream?.url) { mutableIntStateOf(0) }
+    var reconnectAttempt by remember(item.id) { mutableIntStateOf(0) }
+    var isAutoRecovering by remember(item.id) { mutableStateOf(false) }
+    var recoveryJob by remember(item.id) { mutableStateOf<Job?>(null) }
     var aspectMode by remember { mutableStateOf(AspectRatioMode.FIT) }
     var techInfo by remember(item.id) { mutableStateOf(StreamTechInfo()) }
     var audioTracks by remember(item.id) { mutableStateOf<List<TrackOption>>(emptyList()) }
@@ -212,23 +280,22 @@ fun TvPlayerScreen(
         }
     }
 
-    // Build Media3 ExoPlayer with proxy-aware OkHttpDataSource
+    // Build Media3 ExoPlayer with DefaultHttpDataSource (allowCrossProtocolRedirects = true) / Proxy OkHttp
     val exoPlayer = remember(resolvedStream?.url, resolvedStream?.headers) {
         val headers = resolvedStream?.headers.orEmpty()
-        val httpClient = RoutingManager.buildHttpClient(customHeaders = headers)
-        val okHttpFactory = OkHttpDataSource.Factory(httpClient)
+        val dataSourceFactory = buildMedia3DataSourceFactory(headers)
         val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(15_000, 50_000, 1_200, 2_500)
+            .setBufferDurationsMs(15_000, 50_000, 1_000, 2_200)
             .build()
 
         ExoPlayer.Builder(context)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(okHttpFactory))
+            .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
             .setLoadControl(loadControl)
             .build()
             .apply {
                 playWhenReady = true
                 if (!resolvedStream?.url.isNullOrBlank()) {
-                    setMediaItem(Media3Item.fromUri(resolvedStream!!.url))
+                    setMediaItem(buildMedia3MediaItem(resolvedStream!!.url))
                     if (!isLive && item.resumePositionMs > 5_000L) {
                         seekTo(item.resumePositionMs)
                     }
@@ -246,6 +313,8 @@ fun TvPlayerScreen(
             override fun onPlaybackStateChanged(playbackState: Int) {
                 isBuffering = playbackState == Player.STATE_BUFFERING
                 if (playbackState == Player.STATE_READY) {
+                    recoveryJob?.cancel()
+                    isAutoRecovering = false
                     playbackError = null
                     reconnectAttempt = 0
                 }
@@ -311,25 +380,31 @@ fun TvPlayerScreen(
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                isBuffering = false
                 playbackError = error.errorCodeName
-                if (reconnectAttempt < 5) {
+                if (reconnectAttempt < MAX_AUTO_RECONNECTS) {
                     val nextTry = reconnectAttempt + 1
                     reconnectAttempt = nextTry
-                    scope.launch {
-                        delay(1500L * nextTry)
-                        if (nextTry == 2 || nextTry == 4) {
+                    isAutoRecovering = true
+                    recoveryJob?.cancel()
+                    recoveryJob = scope.launch {
+                        delay(if (nextTry == 1) 800L else 1200L)
+                        if (nextTry == 2) {
                             onRefreshStream()
                         } else {
                             exoPlayer.prepare()
                             exoPlayer.playWhenReady = true
                         }
                     }
+                } else {
+                    isAutoRecovering = false
                 }
             }
         }
 
         exoPlayer.addListener(listener)
         onDispose {
+            recoveryJob?.cancel()
             if (!isLive) {
                 val pos = exoPlayer.currentPosition
                 val dur = exoPlayer.duration.coerceAtLeast(0L)
@@ -497,55 +572,55 @@ fun TvPlayerScreen(
             )
         }
 
-        // Buffering / Resolving / Reconnecting Center Pill
-        if (isResolvingStream || isBuffering || playbackError != null || resolveError != null) {
+        // Non-blocking Buffering / Resolving / Error Status Pill (max 2 auto-recoveries, never traps D-Pad zap!)
+        if (isResolvingStream || isBuffering || isAutoRecovering || playbackError != null || resolveError != null) {
+            val isTerminalError = !isResolvingStream && !isAutoRecovering && (resolveError != null || playbackError != null)
             Box(
                 modifier = Modifier
                     .align(Alignment.Center)
                     .clip(RoundedCornerShape(12.dp))
                     .background(ObsidianVoid.copy(alpha = 0.88f))
-                    .border(1.dp, DividerSlate, RoundedCornerShape(12.dp))
+                    .border(
+                        1.dp,
+                        if (isTerminalError) SignalAmber.copy(alpha = 0.65f) else DividerSlate,
+                        RoundedCornerShape(12.dp)
+                    )
                     .padding(horizontal = 24.dp, vertical = 16.dp)
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    if (resolveError == null && (isResolvingStream || isBuffering || reconnectAttempt < 5)) {
+                    if (!isTerminalError) {
                         CircularProgressIndicator(
                             color = BroadcastCyan,
                             strokeWidth = 3.dp,
                             modifier = Modifier.size(24.dp)
                         )
                     }
-                    Column {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         val statusText = when {
-                            isResolvingStream -> "Resolving stream..."
-                            resolveError != null -> "Stream Error: $resolveError"
-                            playbackError != null && reconnectAttempt <= 5 -> "Reconnecting (Attempt $reconnectAttempt/5)..."
-                            playbackError != null -> "Playback Failed ($playbackError)"
+                            isResolvingStream -> "Connecting to stream..."
+                            isAutoRecovering -> "Recovering stream ($reconnectAttempt/$MAX_AUTO_RECONNECTS)..."
+                            resolveError != null -> "Stream unavailable ($resolveError)"
+                            playbackError != null -> "Stream unavailable ($playbackError)"
                             else -> "Buffering..."
                         }
-                        Text(statusText, style = MaterialTheme.typography.titleMedium, color = TextPrimary)
-                        if (resolveError != null || (playbackError != null && reconnectAttempt >= 5)) {
-                            Spacer(Modifier.height(8.dp))
-                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                TvActionButton(
-                                    text = "Retry",
-                                    icon = Icons.Default.Refresh,
-                                    isPrimary = true,
-                                    onClick = {
-                                        reconnectAttempt = 0
-                                        playbackError = null
-                                        onRefreshStream()
-                                    }
-                                )
-                                TvActionButton(
-                                    text = "Exit",
-                                    icon = Icons.AutoMirrored.Filled.ArrowBack,
-                                    onClick = onExitPlayer
-                                )
-                            }
+                        Text(
+                            text = statusText,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = if (isTerminalError) SignalAmber else TextPrimary
+                        )
+                        if (isTerminalError) {
+                            Text(
+                                text = if (isLive) {
+                                    "▲▼ Zap Channel  •  OK Channel List  •  Right/Menu Retry  •  Back Exit"
+                                } else {
+                                    "Press Right/Menu to Retry or Back to Exit"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextSecondary
+                            )
                         }
                     }
                 }
@@ -1176,11 +1251,7 @@ private fun OverlayChannelRow(
             Spacer(Modifier.width(8.dp))
         }
         Text(
-            text = if (channel.channelNumber > 0) {
-                channel.channelNumber.toString().padStart(3, '0')
-            } else {
-                (index + 1).toString().padStart(3, '0')
-            },
+            text = (index + 1).toString().padStart(3, '0'),
             style = MaterialTheme.typography.labelMedium,
             color = if (isFocused || isCurrent) BroadcastCyan else TextMuted,
             modifier = Modifier.width(34.dp)

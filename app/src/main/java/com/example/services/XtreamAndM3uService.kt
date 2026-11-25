@@ -111,7 +111,10 @@ class XtreamAndM3uService(private val context: Context) {
         urlBuilder.addQueryParameter("action", action)
         extra.forEach { (k, v) -> urlBuilder.addQueryParameter(k, v) }
 
-        val client = RoutingManager.buildHttpClient()
+        val client = RoutingManager.buildHttpClient(
+            connectTimeoutSec = 8L,
+            readTimeoutSec = 12L
+        )
         val request = Request.Builder()
             .url(urlBuilder.build())
             .header("User-Agent", "TiviWaveTV/1.0 (AndroidTV)")

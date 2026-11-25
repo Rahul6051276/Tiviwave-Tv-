@@ -110,37 +110,31 @@ fun TvFocusableSurface(
 
     val scale by animateFloatAsState(
         targetValue = if (isFocused) focusScale else 1f,
-        animationSpec = spring(stiffness = Spring.StiffnessMedium, dampingRatio = 0.82f),
+        animationSpec = androidx.compose.animation.core.tween(durationMillis = 80),
         label = "tv_focus_scale"
     )
-    val animatedBg by animateColorAsState(
-        targetValue = when {
-            isFocused -> focusedContainerColor
-            selected -> selectedContainerColor
-            else -> containerColor
-        },
-        label = "tv_focus_bg"
-    )
-    val animatedBorder by animateColorAsState(
-        targetValue = when {
-            isFocused -> focusedBorderColor
-            selected -> BroadcastCyan.copy(alpha = 0.35f)
-            else -> borderColor
-        },
-        label = "tv_focus_border"
-    )
+    val bgColor = when {
+        isFocused -> focusedContainerColor
+        selected -> selectedContainerColor
+        else -> containerColor
+    }
+    val resolvedBorderColor = when {
+        isFocused -> focusedBorderColor
+        selected -> BroadcastCyan.copy(alpha = 0.35f)
+        else -> borderColor
+    }
     val borderStroke = when {
-        isFocused -> BorderStroke(focusedBorderWidth, animatedBorder)
-        selected -> BorderStroke(1.dp, animatedBorder)
-        borderColor != Color.Transparent -> BorderStroke(0.75.dp, animatedBorder)
+        isFocused -> BorderStroke(focusedBorderWidth, resolvedBorderColor)
+        selected -> BorderStroke(1.dp, resolvedBorderColor)
+        borderColor != Color.Transparent -> BorderStroke(0.75.dp, resolvedBorderColor)
         else -> null
     }
 
     Surface(
         shape = shape,
-        color = animatedBg,
+        color = bgColor,
         border = borderStroke,
-        shadowElevation = if (isFocused) 10.dp else 0.dp,
+        shadowElevation = 0.dp,
         modifier = modifier
             .zIndex(if (isFocused) 4f else 0f)
             .scale(scale)

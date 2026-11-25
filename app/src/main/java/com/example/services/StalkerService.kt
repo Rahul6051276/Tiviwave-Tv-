@@ -26,6 +26,9 @@ class StalkerService {
             "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3"
         const val MAG250_X_USER_AGENT = "Model: MAG250; Link: WiFi"
         private const val MAX_PAGES_PER_CATEGORY = 8
+        private const val CONNECT_TIMEOUT_SEC = 8L
+        private const val READ_TIMEOUT_SEC = 12L
+        private const val SESSION_TTL_MS = 30 * 60_000L
     }
 
     private data class StalkerSession(
@@ -36,6 +39,16 @@ class StalkerService {
     )
 
     private val sessionCache = ConcurrentHashMap<String, StalkerSession>()
+
+    private fun buildSessionCacheKey(source: PlaylistSource): String {
+        return listOf(
+            normalizePortalBase(source.portalUrl).lowercase(Locale.US),
+            source.macAddress.trim().uppercase(Locale.US),
+            source.serialNumber.trim(),
+            source.deviceId1.trim(),
+            source.deviceId2.trim()
+        ).joinToString("|")
+    }
 
     private fun buildCookieHeader(source: PlaylistSource): String {
         val encodedMac = URLEncoder.encode(source.macAddress.trim().uppercase(), "UTF-8")
@@ -127,7 +140,11 @@ class StalkerService {
         urlBuilder.addQueryParameter("JsHttpRequest", "1-xml")
 
         val headers = buildStalkerHeaders(source, token)
-        val client = RoutingManager.buildHttpClient(customHeaders = headers)
+        val client = RoutingManager.buildHttpClient(
+            customHeaders = headers,
+            connectTimeoutSec = CONNECT_TIMEOUT_SEC,
+            readTimeoutSec = READ_TIMEOUT_SEC
+        )
         val request = Request.Builder()
             .url(urlBuilder.build())
             .get()
@@ -144,13 +161,15 @@ class StalkerService {
     /**
      * Performs Stalker handshake (`type=stb&action=handshake`) followed by `get_profile`
      * with MAG MAC, Serial Number, Device ID1, Device ID2, and optional signature.
+     * Caches the valid token per portal + MAC + device IDs and reuses it until invalid/expired.
      */
     private suspend fun ensureSession(
         source: PlaylistSource,
         forceRefresh: Boolean = false
     ): StalkerSession = withContext(Dispatchers.IO) {
-        val cached = sessionCache[source.id]
-        if (!forceRefresh && cached != null && System.currentTimeMillis() - cached.createdAtMs < 15 * 60_000L) {
+        val cacheKey = buildSessionCacheKey(source)
+        val cached = sessionCache[cacheKey]
+        if (!forceRefresh && cached != null && System.currentTimeMillis() - cached.createdAtMs < SESSION_TTL_MS) {
             return@withContext cached
         }
 
@@ -208,7 +227,7 @@ class StalkerService {
                 }
 
                 val session = StalkerSession(endpointUrl = endpoint, token = token, random = random)
-                sessionCache[source.id] = session
+                sessionCache[cacheKey] = session
                 return@withContext session
             } catch (e: Exception) {
                 lastError = e
@@ -219,9 +238,23 @@ class StalkerService {
 
     /**
      * Step 1 Metadata-Only Fetch: Fetches Live TV genres, VOD categories, and Series categories.
+     * Reuses cached token if valid, and retries once with a fresh handshake if expired.
      */
     suspend fun fetchAllCategories(source: PlaylistSource): List<ContentCategory> = withContext(Dispatchers.IO) {
-        val session = ensureSession(source, forceRefresh = true)
+        var session = ensureSession(source, forceRefresh = false)
+        var categories = fetchCategoriesWithSession(source, session)
+        if (categories.isEmpty()) {
+            sessionCache.remove(buildSessionCacheKey(source))
+            session = ensureSession(source, forceRefresh = true)
+            categories = fetchCategoriesWithSession(source, session)
+        }
+        categories
+    }
+
+    private fun fetchCategoriesWithSession(
+        source: PlaylistSource,
+        session: StalkerSession
+    ): List<ContentCategory> {
         val categories = mutableListOf<ContentCategory>()
 
         runCatching {
@@ -254,7 +287,7 @@ class StalkerService {
             categories += parseCategoryArray(raw, source.id, ContentType.SERIES)
         }
 
-        categories.distinctBy { "${it.type.name}:${it.id}" }
+        return categories.distinctBy { "${it.type.name}:${it.id}" }
     }
 
     private fun parseCategoryArray(
@@ -547,8 +580,10 @@ class StalkerService {
     }
 
     /**
-     * Dynamically resolves a playable stream URL via Stalker `create_link`,
-     * stripping `ffmpeg `, `ffrt `, `ffrt2 `, `ffrt3 `, and `auto ` prefixes.
+     * Dynamically resolves a playable stream URL via Stalker `create_link`.
+     * Handles `js.url`, `js.cmd`, top-level `url`/`cmd`, raw `js` strings, relative portal paths,
+     * and strips `ffmpeg `, `ffrt `, `ffrt2 `, `ffrt3 `, `ffrt4 `, `ext `, `auto `, quotes, and stray spaces.
+     * Reuses cached token for instant zapping and re-handshakes once if token expired.
      */
     suspend fun resolveStreamLink(
         source: PlaylistSource,
@@ -556,8 +591,7 @@ class StalkerService {
         forceSessionRefresh: Boolean = false
     ): ResolvedStream = withContext(Dispatchers.IO) {
         val rawCmd = item.streamUrlOrCmd.trim()
-        val directCleaned = stripStreamCommandPrefix(rawCmd)
-        val session = ensureSession(source, forceRefresh = forceSessionRefresh)
+        val directCleaned = normalizePlayableStreamUrl(source.portalUrl, rawCmd)
 
         val episodeSuffix = if (rawCmd.contains("||episode=")) {
             rawCmd.substringAfter("||episode=")
@@ -585,20 +619,17 @@ class StalkerService {
             }
         }
 
-        val responseRaw = runCatching {
-            executeRequest(
-                endpointUrl = session.endpointUrl,
-                params = params,
-                source = source,
-                token = session.token
-            )
-        }.getOrNull()
+        var session = ensureSession(source, forceRefresh = forceSessionRefresh)
+        var resolvedUrl = executeCreateLink(session, params, source)
 
-        val resolvedCmd = responseRaw
-            ?.let { parseJsonSafely(it)?.optJSONObject("js")?.optCleanString("cmd") }
-            .orEmpty()
+        // If cached token expired or was rejected, refresh handshake ONCE and retry create_link
+        if (resolvedUrl.isBlank() && !forceSessionRefresh) {
+            sessionCache.remove(buildSessionCacheKey(source))
+            session = ensureSession(source, forceRefresh = true)
+            resolvedUrl = executeCreateLink(session, params, source)
+        }
 
-        val finalUrl = stripStreamCommandPrefix(resolvedCmd.ifBlank { directCleaned })
+        val finalUrl = resolvedUrl.ifBlank { directCleaned }
         if (finalUrl.isBlank()) {
             error("Unable to resolve playable URL from Stalker create_link")
         }
@@ -607,6 +638,37 @@ class StalkerService {
             url = finalUrl,
             headers = buildStalkerHeaders(source, session.token)
         )
+    }
+
+    private fun executeCreateLink(
+        session: StalkerSession,
+        params: Map<String, String>,
+        source: PlaylistSource
+    ): String {
+        val responseRaw = runCatching {
+            executeRequest(
+                endpointUrl = session.endpointUrl,
+                params = params,
+                source = source,
+                token = session.token
+            )
+        }.getOrNull() ?: return ""
+
+        val json = parseJsonSafely(responseRaw) ?: return ""
+        val jsObj = json.optJSONObject("js")
+        val rawCandidate = when {
+            jsObj != null -> {
+                jsObj.optCleanString("url")
+                    .ifBlank { jsObj.optCleanString("cmd") }
+                    .ifBlank { jsObj.optCleanString("stream_url") }
+            }
+            else -> {
+                json.optCleanString("js")
+                    .ifBlank { json.optCleanString("url") }
+                    .ifBlank { json.optCleanString("cmd") }
+            }
+        }
+        return normalizePlayableStreamUrl(source.portalUrl, rawCandidate)
     }
 
     /**
@@ -650,22 +712,47 @@ class StalkerService {
         }.getOrDefault(emptyList())
     }
 
+    /**
+     * Normalizes A-to-Z IPTV stream/media URLs (.m3u8, .ts, .mp4, .mkv, .avi, .mov, .mp3, .aac, raw/proxy URLs):
+     * strips `ffmpeg `, `ffrt `, `ffrt2 `, `ffrt3 `, `ffrt4 `, `ext `, `auto `, `solution `, stray quotes/escapes,
+     * and resolves relative paths cleanly against the portal base URL.
+     */
+    fun normalizePlayableStreamUrl(portalUrl: String, rawCmd: String): String {
+        val stripped = stripStreamCommandPrefix(rawCmd)
+        if (stripped.isBlank()) return ""
+        if (stripped.startsWith("http://", ignoreCase = true) ||
+            stripped.startsWith("https://", ignoreCase = true) ||
+            stripped.startsWith("rtsp://", ignoreCase = true) ||
+            stripped.startsWith("rtmp://", ignoreCase = true)
+        ) {
+            return stripped
+        }
+        return resolvePortalAssetUrl(portalUrl, stripped)
+    }
+
     fun stripStreamCommandPrefix(cmd: String): String {
-        val cleaned = cmd.trim()
-        val prefixes = listOf("ffmpeg ", "ffrt4 ", "ffrt3 ", "ffrt2 ", "ffrt ", "auto ", "solution ")
+        val cleaned = cmd
+            .replace("\\/", "/")
+            .trim()
+            .trim('"', '\'')
+            .trim()
+        if (cleaned.isBlank() || cleaned.equals("null", ignoreCase = true) || cleaned.equals("false", ignoreCase = true)) {
+            return ""
+        }
+        val prefixes = listOf("ffmpeg ", "ffrt4 ", "ffrt3 ", "ffrt2 ", "ffrt ", "ext ", "auto ", "solution ", "vlc ")
         var result = cleaned
         var changed = true
         while (changed) {
             changed = false
             for (prefix in prefixes) {
                 if (result.startsWith(prefix, ignoreCase = true)) {
-                    result = result.substring(prefix.length).trim()
+                    result = result.substring(prefix.length).trim().trim('"', '\'').trim()
                     changed = true
                 }
             }
         }
-        val urlMatch = Regex("(https?|rtsp|rtmp)://\\S+", RegexOption.IGNORE_CASE).find(result)
-        return urlMatch?.value ?: result
+        val urlMatch = Regex("(https?|rtsp|rtmp)://[^\\s\"'<>]+", RegexOption.IGNORE_CASE).find(result)
+        return (urlMatch?.value ?: result).trim().trim('"', '\'')
     }
 
     /**
